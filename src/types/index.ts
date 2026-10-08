@@ -1,5 +1,20 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// ВАЖНО: все денежные суммы хранятся в МИНОРНЫХ ЕДИНИЦАХ (копейках), целым числом.
+// 1 234,56 ₽  →  123456
+// ─────────────────────────────────────────────────────────────────────────────
+
+export type Minor = number
+
 export type TransactionType = 'expense' | 'income' | 'transfer'
-export type CardId = string
+
+export type AccountKind = 'debit' | 'cash' | 'savings' | 'deposit' | 'credit'
+
+export type Currency = 'RUB'
+
+export type Capitalization = 'none' | 'monthly' | 'quarterly' | 'atEnd'
+
+/** Флаг в индексируемых полях: IndexedDB не умеет индексировать boolean. */
+export type Flag = 0 | 1
 
 export interface Category {
   id: string
@@ -7,95 +22,147 @@ export interface Category {
   icon: string
   color: string
   type: 'expense' | 'income' | 'both'
-  isCustom?: boolean
+  /** обязательная трата (ЖКХ, связь) vs дискреционная (развлечения) */
+  essential?: boolean
+}
+
+export interface Account {
+  id: string
+  kind: AccountKind
+  name: string
+  bank: string
+  currency: Currency
+  /** остаток на openingDate; текущий баланс = openingBalance + Σ postings */
+  openingBalance: Minor
+  openingDate: string
+  lastFour?: string
+  color: string
+  isArchived: Flag
+  sortOrder: number
+  // credit
+  creditLimit?: Minor
+  // deposit
+  interestRate?: number
+  capitalization?: Capitalization
+  maturityDate?: string
+  isReplenishable?: Flag
+  createdAt: string
+  updatedAt: string
+  deletedAt?: string | null
 }
 
 export interface Transaction {
   id: string
   type: TransactionType
-  amount: number
+  /** всегда положительная величина; знак живёт в postings */
+  amount: Minor
   categoryId: string
-  cardId: CardId
-  toCardId?: CardId
+  accountId: string
+  toAccountId?: string | null
   title: string
-  comment?: string
-  tags?: string[]
+  comment?: string | null
+  tags?: string[] | null
   date: string
+  /** переводы между своими счетами и корректировки не идут в расходы/доходы */
+  excludeFromStats: Flag
+  goalId?: string | null
+  source: 'manual' | 'reconciliation' | 'goal' | 'import'
   createdAt: string
   updatedAt: string
-  syncedAt?: string
-  goalId?: string
+  deletedAt?: string | null
 }
 
-export interface Card {
+/** Одна «нога» операции. Баланс счёта = openingBalance + Σ amount всех его postings. */
+export interface Posting {
   id: string
-  name: string
-  bank: string
-  balance: number
-  lastFour?: string
-  color: string
-  updatedAt: string
+  transactionId: string
+  accountId: string
+  /** знаковая сумма: + приход, − расход */
+  amount: Minor
+  date: string
 }
 
-export interface Deposit {
-  id: string
-  name: string
-  bank: string
-  amount: number          // текущая сумма
-  interestRate: number    // % годовых
-  expectedDate: string    // дата поступления (ISO)
-  expectedAmount: number  // ожидаемая сумма с процентами
-  color: string
-  createdAt: string
-  isActive: boolean
-}
+export type GoalKind = 'save' | 'cushion'
 
 export interface Goal {
   id: string
   title: string
   icon: string
-  targetAmount: number
-  currentAmount: number
-  deadline?: string
+  kind: GoalKind
+  targetAmount: Minor
+  /** если задан — currentAmount берётся из баланса этого счёта, а не вводится руками */
+  fundingAccountId?: string | null
+  /** ручной режим: сколько уже накоплено (когда счёт не привязан) */
+  manualAmount: Minor
+  /** для kind='cushion': на сколько месяцев расходов копим */
+  cushionMonths?: number
+  deadline?: string | null
+  isArchived: Flag
   createdAt: string
-  completedAt?: string
-  isArchived: boolean
+  completedAt?: string | null
+  updatedAt: string
+  deletedAt?: string | null
 }
 
-export interface RecurringPayment {
+export interface Budget {
   id: string
-  title: string
-  amount: number
-  cardId: CardId
   categoryId: string
-  dayOfMonth: number
-  isActive: boolean
+  amount: Minor
+  period: 'month'
+  updatedAt: string
+  deletedAt?: string | null
 }
 
-export interface CategoryLimit {
-  categoryId: string
-  amount: number
-  period: 'month' | 'week'
+/** Снимок сверки с реальным балансом в банке. */
+export interface BalanceSnapshot {
+  id: string
+  accountId: string
+  at: string
+  statedBalance: Minor
+  derivedBalance: Minor
+  gap: Minor
+  resolution: 'adjusted' | 'ignored'
+  createdAt: string
+  updatedAt: string
+  deletedAt?: string | null
 }
 
 export interface AppSettings {
+  id: 1
   userName: string
-  dailyLimit?: number
-  categoryLimits: CategoryLimit[]
-  reminderDay?: number
-  reminderHour?: number
-  theme: 'dark' | 'light'
-  currency: '₽'
+  currency: Currency
+  theme: 'dark'
+  /** сколько месяцев берём для расчёта runway и «подушки» */
+  runwayWindowMonths: number
+  updatedAt: string
 }
+
+export type SyncEntity =
+  | 'account' | 'transaction' | 'posting' | 'goal' | 'budget' | 'snapshot' | 'settings'
 
 export interface SyncQueueItem {
   id: string
-  entityType: 'transaction' | 'goal' | 'card' | 'settings' | 'deposit'
+  entityType: SyncEntity
   entityId: string
-  operation: 'create' | 'update' | 'delete'
+  operation: 'upsert' | 'delete'
   payload: unknown
   createdAt: string
+  retryCount: number
+  lastError?: string | null
+  /** 1 — перестали пытаться, показываем пользователю */
+  dead: Flag
 }
 
-export type TabId = 'home' | 'transactions' | 'add' | 'stats' | 'goals' | 'cards'
-export type Period = 'week' | 'month' | 'quarter' | 'year' | 'custom'
+export interface MetaRow {
+  key: string
+  value: string
+}
+
+export type TabId = 'home' | 'transactions' | 'stats' | 'accounts' | 'goals' | 'settings'
+export type PeriodId = 'week' | 'month' | 'quarter' | 'year' | 'custom'
+
+export interface Range {
+  from: Date
+  to: Date
+  label: string
+}

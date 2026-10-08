@@ -1,17 +1,30 @@
-import Dexie, { type Table } from 'dexie'
-import type { Transaction, Card, Goal, Deposit, RecurringPayment, AppSettings, SyncQueueItem } from '../types'
+import Dexie, { type Table, type Transaction as DexieTx } from 'dexie'
+import { v4 as uuid } from 'uuid'
+import type {
+  Account, Transaction, Posting, Goal, Budget,
+  BalanceSnapshot, AppSettings, SyncQueueItem, MetaRow,
+} from '../types'
 
+/**
+ * ВНИМАНИЕ по индексам: IndexedDB не умеет индексировать boolean —
+ * запись просто не попадает в индекс, а `.equals(false)` бросает DataError.
+ * Поэтому все флаги хранятся как 0 | 1.
+ */
 class FinFlowDB extends Dexie {
-  transactions!: Table<Transaction>
-  cards!: Table<Card>
-  goals!: Table<Goal>
-  deposits!: Table<Deposit>
-  recurringPayments!: Table<RecurringPayment>
-  settings!: Table<AppSettings & { id: 1 }>
-  syncQueue!: Table<SyncQueueItem>
+  accounts!: Table<Account, string>
+  transactions!: Table<Transaction, string>
+  postings!: Table<Posting, string>
+  goals!: Table<Goal, string>
+  budgets!: Table<Budget, string>
+  snapshots!: Table<BalanceSnapshot, string>
+  settings!: Table<AppSettings, number>
+  syncQueue!: Table<SyncQueueItem, string>
+  meta!: Table<MetaRow, string>
 
   constructor() {
     super('FinFlowDB')
+
+    // v1 / v2 — историческая схема (карты + вклады, суммы в рублях-float).
     this.version(1).stores({
       transactions: 'id, type, categoryId, cardId, date, createdAt, syncedAt, goalId',
       cards: 'id, bank',
@@ -20,7 +33,6 @@ class FinFlowDB extends Dexie {
       settings: 'id',
       syncQueue: 'id, entityType, entityId, createdAt',
     })
-    // v2 — add deposits
     this.version(2).stores({
       transactions: 'id, type, categoryId, cardId, date, createdAt, syncedAt, goalId',
       cards: 'id, bank',
@@ -30,24 +42,197 @@ class FinFlowDB extends Dexie {
       settings: 'id',
       syncQueue: 'id, entityType, entityId, createdAt',
     })
+
+    // v3 — счета + проводки, суммы в копейках, флаги 0/1.
+    this.version(3)
+      .stores({
+        accounts: 'id, kind, isArchived, sortOrder, updatedAt',
+        transactions: 'id, type, categoryId, accountId, toAccountId, date, goalId, excludeFromStats, updatedAt, deletedAt',
+        postings: 'id, transactionId, accountId, date',
+        goals: 'id, isArchived, fundingAccountId, createdAt, updatedAt',
+        budgets: 'id, categoryId, updatedAt',
+        snapshots: 'id, accountId, at',
+        settings: 'id',
+        syncQueue: 'id, entityType, entityId, createdAt, dead',
+        meta: 'key',
+        // старые хранилища больше не нужны
+        cards: null,
+        deposits: null,
+        recurringPayments: null,
+      })
+      .upgrade(migrateV2toV3)
   }
 }
 
 export const db = new FinFlowDB()
 
-export async function isFirstLaunch(): Promise<boolean> {
-  const s = await db.settings.get(1)
-  return !s
+// ─────────────────────────────────────────────────────────────────────────────
+// Миграция старых данных
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface OldCard { id: string; name: string; bank: string; balance: number; lastFour?: string; color: string; updatedAt: string }
+interface OldDeposit { id: string; name: string; bank: string; amount: number; interestRate: number; expectedDate: string; color: string; createdAt: string; isActive: boolean }
+interface OldTx { id: string; type: string; amount: number; categoryId: string; cardId: string; toCardId?: string; title: string; comment?: string; date: string; createdAt: string; updatedAt: string; goalId?: string }
+interface OldGoal { id: string; title: string; icon: string; targetAmount: number; currentAmount: number; deadline?: string; createdAt: string; completedAt?: string; isArchived: boolean }
+
+async function migrateV2toV3(tx: DexieTx) {
+  const now = new Date().toISOString()
+  const r = (n: unknown) => Math.round((Number(n) || 0) * 100)
+
+  const oldCards = await tx.table('cards').toArray().catch(() => []) as OldCard[]
+  const oldDeps = await tx.table('deposits').toArray().catch(() => []) as OldDeposit[]
+  const oldTxs = await tx.table('transactions').toArray().catch(() => []) as OldTx[]
+  const oldGoals = await tx.table('goals').toArray().catch(() => []) as OldGoal[]
+
+  const accounts: Account[] = []
+  const postings: Posting[] = []
+  const transactions: Transaction[] = []
+
+  // Сумма проводок по счёту, чтобы вычислить корректный openingBalance:
+  // openingBalance = текущий_баланс − Σ проводок. Тогда после миграции
+  // вычисляемый баланс совпадёт с тем, что пользователь видел раньше.
+  const deltaByAccount = new Map<string, number>()
+  const addDelta = (id: string, v: number) => deltaByAccount.set(id, (deltaByAccount.get(id) ?? 0) + v)
+
+  for (const t of oldTxs) {
+    const amount = Math.abs(r(t.amount))
+    const type = t.type === 'income' ? 'income' : t.type === 'transfer' ? 'transfer' : 'expense'
+    const legs: Posting[] = []
+    if (type === 'income') {
+      legs.push({ id: uuid(), transactionId: t.id, accountId: t.cardId, amount, date: t.date })
+      addDelta(t.cardId, amount)
+    } else if (type === 'expense') {
+      legs.push({ id: uuid(), transactionId: t.id, accountId: t.cardId, amount: -amount, date: t.date })
+      addDelta(t.cardId, -amount)
+    } else {
+      legs.push({ id: uuid(), transactionId: t.id, accountId: t.cardId, amount: -amount, date: t.date })
+      addDelta(t.cardId, -amount)
+      if (t.toCardId) {
+        legs.push({ id: uuid(), transactionId: t.id, accountId: t.toCardId, amount, date: t.date })
+        addDelta(t.toCardId, amount)
+      }
+    }
+    postings.push(...legs)
+    transactions.push({
+      id: t.id,
+      type: type as Transaction['type'],
+      amount,
+      categoryId: t.categoryId || 'other_exp',
+      accountId: t.cardId,
+      toAccountId: t.toCardId ?? null,
+      title: t.title ?? '',
+      comment: t.comment ?? null,
+      tags: null,
+      date: t.date,
+      excludeFromStats: type === 'transfer' ? 1 : 0,
+      goalId: t.goalId ?? null,
+      source: 'manual',
+      createdAt: t.createdAt ?? now,
+      updatedAt: now,
+      deletedAt: null,
+    })
+  }
+
+  oldCards.forEach((c, i) => {
+    accounts.push({
+      id: c.id, kind: 'debit', name: c.name, bank: c.bank, currency: 'RUB',
+      openingBalance: r(c.balance) - (deltaByAccount.get(c.id) ?? 0),
+      openingDate: '1970-01-01T00:00:00.000Z',
+      lastFour: c.lastFour, color: c.color, isArchived: 0, sortOrder: i,
+      createdAt: c.updatedAt ?? now, updatedAt: now, deletedAt: null,
+    })
+  })
+
+  oldDeps.forEach((d, i) => {
+    accounts.push({
+      id: d.id, kind: 'deposit', name: d.name, bank: d.bank, currency: 'RUB',
+      openingBalance: r(d.amount) - (deltaByAccount.get(d.id) ?? 0),
+      openingDate: d.createdAt ?? '1970-01-01T00:00:00.000Z',
+      color: d.color, isArchived: d.isActive === false ? 1 : 0, sortOrder: oldCards.length + i,
+      interestRate: d.interestRate, capitalization: 'atEnd',
+      maturityDate: d.expectedDate || null as unknown as string,
+      isReplenishable: 0,
+      createdAt: d.createdAt ?? now, updatedAt: now, deletedAt: null,
+    })
+  })
+
+  // Счета, на которые ссылались операции, но которых нет (например, зашитый 'vtb')
+  const known = new Set(accounts.map(a => a.id))
+  for (const [accId, delta] of deltaByAccount) {
+    if (known.has(accId)) continue
+    accounts.push({
+      id: accId, kind: 'debit', name: `Восстановленный счёт ${accId.slice(0, 6)}`,
+      bank: 'other', currency: 'RUB',
+      openingBalance: -delta, openingDate: '1970-01-01T00:00:00.000Z',
+      color: '#6C63FF', isArchived: 0, sortOrder: accounts.length,
+      createdAt: now, updatedAt: now, deletedAt: null,
+    })
+  }
+
+  const goals: Goal[] = oldGoals.map(g => ({
+    id: g.id, title: g.title, icon: g.icon || '🎯', kind: 'save',
+    targetAmount: r(g.targetAmount), fundingAccountId: null,
+    manualAmount: r(g.currentAmount),
+    deadline: g.deadline || null, isArchived: g.isArchived ? 1 : 0,
+    createdAt: g.createdAt ?? now, completedAt: g.completedAt ?? null,
+    updatedAt: now, deletedAt: null,
+  }))
+
+  await tx.table('accounts').bulkPut(accounts)
+  await tx.table('postings').bulkPut(postings)
+  await tx.table('transactions').clear()
+  await tx.table('transactions').bulkPut(transactions)
+  await tx.table('goals').clear()
+  await tx.table('goals').bulkPut(goals)
+  // очередь старого формата несовместима — начинаем с чистого листа,
+  // полный заливной push сделает первый же sync
+  await tx.table('syncQueue').clear()
+
+  console.info('[migrate v2→v3]', {
+    accounts: accounts.length, transactions: transactions.length,
+    postings: postings.length, goals: goals.length,
+  })
 }
 
-export async function seedDefaultUser(): Promise<void> {
-  const exists = await db.settings.get(1)
-  if (exists) return
-  await db.settings.put({
-    id: 1 as 1,
-    userName: 'Denis',
-    categoryLimits: [],
-    theme: 'dark',
-    currency: '₽',
+// ─────────────────────────────────────────────────────────────────────────────
+// Настройки / meta
+// ─────────────────────────────────────────────────────────────────────────────
+
+export const DEFAULT_SETTINGS: AppSettings = {
+  id: 1,
+  userName: '',
+  currency: 'RUB',
+  theme: 'dark',
+  runwayWindowMonths: 3,
+  updatedAt: new Date().toISOString(),
+}
+
+export async function getSettings(): Promise<AppSettings | undefined> {
+  return db.settings.get(1)
+}
+
+export async function isFirstLaunch(): Promise<boolean> {
+  return !(await db.settings.get(1))
+}
+
+export async function getMeta(key: string): Promise<string | null> {
+  return (await db.meta.get(key))?.value ?? null
+}
+
+export async function setMeta(key: string, value: string): Promise<void> {
+  await db.meta.put({ key, value })
+}
+
+/** Полная очистка локальных данных — при выходе из аккаунта или смене пользователя. */
+export async function wipeLocal(): Promise<void> {
+  await db.transaction('rw', [
+    db.accounts, db.transactions, db.postings, db.goals,
+    db.budgets, db.snapshots, db.settings, db.syncQueue, db.meta,
+  ], async () => {
+    await Promise.all([
+      db.accounts.clear(), db.transactions.clear(), db.postings.clear(),
+      db.goals.clear(), db.budgets.clear(), db.snapshots.clear(),
+      db.settings.clear(), db.syncQueue.clear(), db.meta.clear(),
+    ])
   })
 }

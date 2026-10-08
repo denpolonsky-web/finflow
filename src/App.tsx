@@ -1,98 +1,180 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
+import { CloudOff, RefreshCw, AlertTriangle } from 'lucide-react'
 import { AppProvider, useApp } from './store/AppContext'
+import { ErrorBoundary } from './components/ErrorBoundary'
 import { BottomNav } from './components/layout/BottomNav'
 import { HomeScreen } from './components/screens/HomeScreen'
 import { TransactionsScreen } from './components/screens/TransactionsScreen'
 import { StatsScreen } from './components/screens/StatsScreen'
 import { GoalsScreen } from './components/screens/GoalsScreen'
-import { CardsScreen } from './components/screens/CardsScreen'
-import { AddTransactionSheet } from './components/screens/AddTransactionSheet'
+import { AccountsScreen } from './components/screens/AccountsScreen'
+import { SettingsScreen } from './components/screens/SettingsScreen'
+import { TransactionSheet } from './components/screens/TransactionSheet'
 import { OnboardingScreen } from './components/screens/OnboardingScreen'
+import { AuthScreen } from './components/screens/AuthScreen'
 import { isFirstLaunch } from './db'
-import { useOfflineSync } from './hooks/useOfflineSync'
-import { registerDevice } from './db/deviceToken'
-import { pullFromSupabase } from './db/syncDown'
-import { hasSupabase } from './db/supabase'
+import { hasSupabase, withTimeout } from './db/supabase'
+import { getSession, onAuthChange, onUserResolved } from './db/auth'
+import { bootstrapSync } from './db/sync'
+import { useSync } from './hooks/useSync'
 
-function SyncBanner() {
-  const { status, pendingCount, attemptSync, hasSupabase } = useOfflineSync()
-  if (status === 'online') return null
+const LOCAL_ONLY_KEY = 'finflow.localOnly'
 
-  const cfg = {
-    offline: { bg: 'bg-bg-card2 border-b border-border',             text: 'text-text-secondary', label: '📵 Офлайн — данные сохраняются локально' },
-    syncing: { bg: 'bg-accent/10 border-b border-accent/20',         text: 'text-accent',         label: '🔄 Синхронизация...' },
-    pending: { bg: 'bg-yellow-500/10 border-b border-yellow-500/20', text: 'text-yellow-400',     label: `☁️ Ожидает синхронизации: ${pendingCount}` },
-  } as const
-  const c = cfg[status as keyof typeof cfg] ?? cfg.offline
+type Phase = 'booting' | 'auth' | 'onboarding' | 'ready'
 
+function Splash({ text }: { text: string }) {
   return (
-    <div className={`fixed top-0 left-0 right-0 z-50 ${c.bg} py-2 px-4 flex items-center justify-between`}>
-      <p className={`text-xs font-medium ${c.text}`}>{c.label}</p>
-      {status === 'pending' && (
-        <button onClick={attemptSync} className="text-xs text-accent underline">
-          {hasSupabase ? 'Синхр.' : 'Нет сервера'}
-        </button>
+    <div className="min-h-dvh bg-bg-primary flex flex-col items-center justify-center gap-3">
+      <div className="text-5xl animate-pulse">💰</div>
+      <p className="text-text-muted text-sm">{text}</p>
+    </div>
+  )
+}
+
+function SyncBanner({ status, pending, onRetry }: {
+  status: ReturnType<typeof useSync>['status']; pending: number; onRetry: () => void
+}) {
+  if (status === 'online' || status === 'local') return null
+  const cfg = {
+    offline: { cls: 'bg-bg-card2 border-border text-text-secondary', icon: <CloudOff size={13} />, label: 'Офлайн — данные сохраняются локально' },
+    syncing: { cls: 'bg-accent/10 border-accent/20 text-accent', icon: <RefreshCw size={13} className="animate-spin" />, label: 'Синхронизация…' },
+    pending: { cls: 'bg-yellow-500/10 border-yellow-500/20 text-yellow-400', icon: <RefreshCw size={13} />, label: `Ожидает отправки: ${pending}` },
+    error:   { cls: 'bg-red-500/10 border-red-500/20 text-accent-red', icon: <AlertTriangle size={13} />, label: 'Ошибка синхронизации' },
+  } as const
+  const c = cfg[status as keyof typeof cfg]
+  if (!c) return null
+  return (
+    <div className={`fixed top-0 left-0 right-0 z-50 border-b py-2 px-4 flex items-center justify-between ${c.cls}`}
+      style={{ paddingTop: 'max(env(safe-area-inset-top), 0.5rem)' }}>
+      <p className="text-xs font-medium flex items-center gap-1.5">{c.icon} {c.label}</p>
+      {(status === 'pending' || status === 'error') && (
+        <button onClick={onRetry} className="text-xs underline">Повторить</button>
       )}
     </div>
   )
 }
 
-function AppInner() {
-  const { activeTab } = useApp()
-  const [loading,   setLoading]   = useState(true)
-  const [onboarded, setOnboarded] = useState(true)
-
-  useEffect(() => {
-    async function init() {
-      // Always pull from Supabase first if online — regardless of onboarding state
-      if (hasSupabase && navigator.onLine) {
-        console.log('[App] pulling from Supabase...')
-        await pullFromSupabase()
-        console.log('[App] pull done')
-      }
-
-      // Check if settings exist locally (after pull they might)
-      const first = await isFirstLaunch()
-      setOnboarded(!first)
-      registerDevice()
-      setLoading(false)
-    }
-    init()
-  }, [])
-
-  if (loading) return (
-    <div className="min-h-dvh bg-bg-primary flex flex-col items-center justify-center gap-3">
-      <div className="text-5xl animate-pulse">💰</div>
-      <p className="text-text-muted text-sm">
-        {hasSupabase && navigator.onLine ? 'Загрузка данных...' : 'Запуск...'}
-      </p>
+function Toast() {
+  const { toast } = useApp()
+  if (!toast) return null
+  return (
+    <div className="fixed left-0 right-0 z-[60] flex justify-center px-4 pointer-events-none"
+      style={{ bottom: 'calc(5.5rem + env(safe-area-inset-bottom))' }}>
+      <div className="bg-bg-card2 border border-border text-text-primary text-sm px-4 py-2.5 rounded-xl shadow-lg">
+        {toast}
+      </div>
     </div>
   )
+}
 
-  if (!onboarded) return (
-    <OnboardingScreen onDone={() => setOnboarded(true)} />
-  )
+function AppInner() {
+  const { activeTab, isAddOpen, closeAdd, editTx, setEditTx } = useApp()
+  const [phase, setPhase] = useState<Phase>('booting')
+  const [splashText, setSplashText] = useState('Запуск…')
+  const [authed, setAuthed] = useState(false)
+  const [localOnly, setLocalOnly] = useState(() => localStorage.getItem(LOCAL_ONLY_KEY) === '1')
+
+  const sync = useSync(authed)
+
+  /**
+   * Критично: каждый шаг инициализации обёрнут в try/catch и таймаут.
+   * В прошлой версии незавершившийся запрос к Supabase оставлял приложение
+   * на сплэше навсегда, а аналогичный await в онбординге делал кнопку мёртвой.
+   */
+  const boot = useCallback(async () => {
+    try {
+      let signedIn = false
+      if (hasSupabase && !localOnly) {
+        setSplashText('Проверяем вход…')
+        const session = await getSession()
+        signedIn = Boolean(session)
+        if (session) await onUserResolved(session.user)
+        if (!signedIn) { setPhase('auth'); return }
+      }
+      setAuthed(signedIn)
+
+      if (signedIn && navigator.onLine) {
+        setSplashText('Загружаем данные…')
+        // даже если облако не ответит — идём дальше и работаем локально
+        await withTimeout(bootstrapSync(), 15_000, 'bootstrapSync')
+      }
+
+      setPhase((await isFirstLaunch()) ? 'onboarding' : 'ready')
+    } catch (e) {
+      console.error('[boot]', e)
+      // приложение всё равно должно открыться: данные лежат локально
+      try {
+        setPhase((await isFirstLaunch()) ? 'onboarding' : 'ready')
+      } catch {
+        setPhase('ready')
+      }
+    }
+  }, [localOnly])
+
+  useEffect(() => { void boot() }, [boot])
+
+  useEffect(() => onAuthChange(session => {
+    if (!session && hasSupabase && !localOnly) { setAuthed(false); setPhase('auth') }
+  }), [localOnly])
+
+  if (phase === 'booting') return <Splash text={splashText} />
+
+  if (phase === 'auth') {
+    return (
+      <AuthScreen
+        onAuthed={() => { setAuthed(true); setPhase('booting'); void boot() }}
+        onLocalOnly={() => {
+          localStorage.setItem(LOCAL_ONLY_KEY, '1')
+          setLocalOnly(true)
+          setPhase('booting')
+        }}
+      />
+    )
+  }
+
+  if (phase === 'onboarding') {
+    return <OnboardingScreen onDone={() => setPhase('ready')} />
+  }
 
   return (
     <div className="min-h-dvh bg-bg-primary text-text-primary">
-      <SyncBanner />
-      <div className="max-w-lg mx-auto px-4 pt-12">
-        {activeTab === 'home'         && <HomeScreen />}
+      <SyncBanner status={sync.status} pending={sync.pending} onRetry={sync.syncNow} />
+      <div className="max-w-lg mx-auto px-4" style={{ paddingTop: 'calc(1rem + env(safe-area-inset-top))' }}>
+        {activeTab === 'home' && <HomeScreen />}
         {activeTab === 'transactions' && <TransactionsScreen />}
-        {activeTab === 'stats'        && <StatsScreen />}
-        {activeTab === 'goals'        && <GoalsScreen />}
-        {activeTab === 'cards'        && <CardsScreen />}
+        {activeTab === 'stats' && <StatsScreen />}
+        {activeTab === 'goals' && <GoalsScreen />}
+        {activeTab === 'accounts' && <AccountsScreen />}
+        {activeTab === 'settings' && (
+          <SettingsScreen
+            syncStatus={sync.status}
+            pending={sync.pending}
+            dead={sync.dead}
+            lastError={sync.lastError}
+            onSync={sync.syncNow}
+            onSignedOut={() => {
+              localStorage.removeItem(LOCAL_ONLY_KEY)
+              setLocalOnly(false)
+              setAuthed(false)
+              setPhase('auth')
+            }}
+          />
+        )}
       </div>
       <BottomNav />
-      <AddTransactionSheet />
+      <TransactionSheet open={isAddOpen} tx={null} onClose={closeAdd} />
+      <TransactionSheet open={Boolean(editTx)} tx={editTx} onClose={() => setEditTx(null)} />
+      <Toast />
     </div>
   )
 }
 
 export default function App() {
   return (
-    <AppProvider>
-      <AppInner />
-    </AppProvider>
+    <ErrorBoundary>
+      <AppProvider>
+        <AppInner />
+      </AppProvider>
+    </ErrorBoundary>
   )
 }

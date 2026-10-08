@@ -1,46 +1,82 @@
-import { format, isToday, isYesterday, startOfWeek, startOfMonth, startOfQuarter, startOfYear } from 'date-fns'
+import { format, isToday, isYesterday } from 'date-fns'
 import { ru } from 'date-fns/locale'
-import type { Period } from '../types'
+import type { Minor } from '../types'
+import { toMajor } from './money'
 
-export function formatMoney(amount: number, compact = false): string {
-  if (compact && Math.abs(amount) >= 1_000_000) {
-    return new Intl.NumberFormat('ru-RU', {
-      style: 'currency', currency: 'RUB',
-      notation: 'compact', maximumFractionDigits: 1,
-    }).format(amount)
+const rub = (opts: Intl.NumberFormatOptions) =>
+  new Intl.NumberFormat('ru-RU', { style: 'currency', currency: 'RUB', ...opts })
+
+/**
+ * Копейки показываем всегда, когда они есть — иначе итоги «не бьются» на глаз.
+ * compact — для плиток: от 100 000 ₽ переходим в сокращённую запись.
+ */
+export function formatMoney(m: Minor, compact = false): string {
+  const v = toMajor(m)
+  if (compact && Math.abs(v) >= 100_000) {
+    return rub({ notation: 'compact', maximumFractionDigits: 1 }).format(v)
   }
-  return new Intl.NumberFormat('ru-RU', {
-    style: 'currency', currency: 'RUB',
-    minimumFractionDigits: 0, maximumFractionDigits: 0,
-  }).format(amount)
+  const hasKopecks = m % 100 !== 0
+  return rub({
+    minimumFractionDigits: hasKopecks ? 2 : 0,
+    maximumFractionDigits: hasKopecks ? 2 : 0,
+  }).format(v)
 }
 
-export function formatNumber(amount: number): string {
-  return new Intl.NumberFormat('ru-RU').format(Math.round(amount))
+export function formatSigned(m: Minor, compact = false): string {
+  return (m > 0 ? '+' : m < 0 ? '−' : '') + formatMoney(Math.abs(m), compact)
 }
 
 export function formatDate(iso: string): string {
   const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return '—'
   if (isToday(d)) return 'Сегодня'
   if (isYesterday(d)) return 'Вчера'
   return format(d, 'd MMMM yyyy', { locale: ru })
 }
 
 export function formatTime(iso: string): string {
-  return format(new Date(iso), 'HH:mm')
+  const d = new Date(iso)
+  return Number.isNaN(d.getTime()) ? '' : format(d, 'HH:mm')
 }
 
 export function formatDateShort(iso: string): string {
-  return format(new Date(iso), 'd MMM', { locale: ru })
+  const d = new Date(iso)
+  return Number.isNaN(d.getTime()) ? '—' : format(d, 'd MMM', { locale: ru })
 }
 
-export function getPeriodRange(period: Period, customFrom?: Date, customTo?: Date): { from: Date; to: Date } {
-  const now = new Date()
-  switch (period) {
-    case 'week':    return { from: startOfWeek(now, { weekStartsOn: 1 }), to: now }
-    case 'month':   return { from: startOfMonth(now), to: now }
-    case 'quarter': return { from: startOfQuarter(now), to: now }
-    case 'year':    return { from: startOfYear(now), to: now }
-    case 'custom':  return { from: customFrom ?? startOfMonth(now), to: customTo ?? now }
-  }
+/** ISO → значение для <input type="datetime-local"> в ЛОКАЛЬНОМ времени. */
+export function isoToLocalInput(iso: string): string {
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return ''
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
+
+/** Значение <input type="datetime-local"> (локальное) → ISO. */
+export function localInputToIso(v: string): string {
+  const d = new Date(v)
+  return Number.isNaN(d.getTime()) ? new Date().toISOString() : d.toISOString()
+}
+
+export function isoDateOnly(iso?: string | null): string {
+  if (!iso) return ''
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return ''
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+}
+
+/** Сколько дней осталось до даты. null — если даты нет или она битая. */
+export function daysLeft(iso?: string | null): number | null {
+  if (!iso) return null
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return null
+  return Math.ceil((d.getTime() - Date.now()) / 86_400_000)
+}
+
+export function plural(n: number, one: string, few: string, many: string): string {
+  const m10 = n % 10, m100 = n % 100
+  if (m10 === 1 && m100 !== 11) return one
+  if (m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14)) return few
+  return many
 }
