@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { Eye, EyeOff, Loader2 } from 'lucide-react'
 import { checkPassword, requestPasswordReset, signIn, signUp } from '../../db/auth'
 import { inputCls, primaryBtn } from '../ui/Sheet'
+import { supabaseHost } from '../../db/supabase'
 
 type Mode = 'signin' | 'signup' | 'reset'
 
@@ -137,6 +138,9 @@ export function AuthScreen({ onAuthed, onLocalOnly }: { onAuthed: () => void; on
           Пароль проверяется и хранится на стороне Supabase в виде bcrypt-хэша.
           В приложение и в базу финансов он не попадает.
         </p>
+        {supabaseHost && (
+          <p className="text-text-muted/60 text-[10px] text-center">Сервер: {supabaseHost}</p>
+        )}
       </div>
     </div>
   )

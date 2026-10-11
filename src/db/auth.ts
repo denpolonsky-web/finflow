@@ -1,4 +1,5 @@
-import { supabase, hasSupabase, withTimeout } from './supabase'
+import { supabase, hasSupabase, withTimeout, diagnoseCloud, cloudDisabledReason } from './supabase'
+import { isNetworkFailure } from './cloudConfig'
 import { getMeta, setMeta, wipeLocal } from './index'
 import type { Session, User } from '@supabase/supabase-js'
 
@@ -67,24 +68,37 @@ function humanError(message: string): string {
   if (m.includes('user already registered')) return 'Такой email уже зарегистрирован'
   if (m.includes('rate limit') || m.includes('too many')) return 'Слишком много попыток, подождите минуту'
   if (m.includes('password')) return 'Пароль не принят сервером: ' + message
-  if (m.includes('fetch') || m.includes('network')) return 'Нет связи с сервером'
   return message
 }
 
+/**
+ * Единая точка превращения ошибки supabase-js в текст для человека.
+ * Сетевой сбой («Load failed» в Safari) сам по себе ничего не говорит, поэтому
+ * в этом случае делаем пробу сервера и объясняем конкретную причину.
+ */
+async function explainAuthError(err: { message: string; status?: number }): Promise<string> {
+  if (isNetworkFailure(err.message, err.status)) return diagnoseCloud()
+  return humanError(err.message)
+}
+
+function notConfigured(): AuthResult {
+  return { ok: false, error: `Облако не настроено${cloudDisabledReason ? ': ' + cloudDisabledReason : ''}` }
+}
+
 export async function signIn(email: string, password: string): Promise<AuthResult> {
-  if (!supabase) return { ok: false, error: 'Облако не настроено' }
+  if (!supabase) return notConfigured()
   const res = await withTimeout(
     supabase.auth.signInWithPassword({ email: email.trim(), password }),
     15_000, 'signIn',
   )
-  if (!res) return { ok: false, error: 'Сервер не ответил. Попробуйте ещё раз' }
-  if (res.error) return { ok: false, error: humanError(res.error.message) }
+  if (!res) return { ok: false, error: await diagnoseCloud() }
+  if (res.error) return { ok: false, error: await explainAuthError(res.error) }
   await onUserResolved(res.data.user)
   return { ok: true }
 }
 
 export async function signUp(email: string, password: string): Promise<AuthResult> {
-  if (!supabase) return { ok: false, error: 'Облако не настроено' }
+  if (!supabase) return notConfigured()
   const check = checkPassword(password)
   if (!check.ok) return { ok: false, error: check.message }
 
@@ -92,8 +106,8 @@ export async function signUp(email: string, password: string): Promise<AuthResul
     supabase.auth.signUp({ email: email.trim(), password }),
     15_000, 'signUp',
   )
-  if (!res) return { ok: false, error: 'Сервер не ответил. Попробуйте ещё раз' }
-  if (res.error) return { ok: false, error: humanError(res.error.message) }
+  if (!res) return { ok: false, error: await diagnoseCloud() }
+  if (res.error) return { ok: false, error: await explainAuthError(res.error) }
 
   // если в проекте включено подтверждение email — сессии ещё нет
   if (!res.data.session) return { ok: true, needsConfirmation: true }
@@ -102,13 +116,13 @@ export async function signUp(email: string, password: string): Promise<AuthResul
 }
 
 export async function requestPasswordReset(email: string): Promise<AuthResult> {
-  if (!supabase) return { ok: false, error: 'Облако не настроено' }
+  if (!supabase) return notConfigured()
   const res = await withTimeout(
     supabase.auth.resetPasswordForEmail(email.trim(), { redirectTo: window.location.origin }),
     15_000, 'reset',
   )
-  if (!res) return { ok: false, error: 'Сервер не ответил' }
-  if (res.error) return { ok: false, error: humanError(res.error.message) }
+  if (!res) return { ok: false, error: await diagnoseCloud() }
+  if (res.error) return { ok: false, error: await explainAuthError(res.error) }
   return { ok: true }
 }
 
