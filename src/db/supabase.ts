@@ -18,7 +18,7 @@ export const supabase: SupabaseClient | null = parsed.ok
       auth: {
         persistSession: true,        // сессия переживает перезагрузку → офлайн-вход работает
         autoRefreshToken: true,
-        detectSessionInUrl: true,
+        detectSessionInUrl: false,     // ссылок из писем нет
         storageKey: 'finflow.auth',
       },
     })

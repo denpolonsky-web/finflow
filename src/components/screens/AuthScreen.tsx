@@ -1,45 +1,29 @@
 import { useState } from 'react'
 import { Eye, EyeOff, Loader2 } from 'lucide-react'
-import { checkPassword, requestPasswordReset, signIn, signUp } from '../../db/auth'
+import { signIn } from '../../db/auth'
 import { inputCls, primaryBtn } from '../ui/Sheet'
 import { supabaseHost } from '../../db/supabase'
 
-type Mode = 'signin' | 'signup' | 'reset'
-
-const STRENGTH_COLORS = ['bg-accent-red', 'bg-accent-red', 'bg-accent-yellow', 'bg-accent-green', 'bg-accent-green']
-
+/**
+ * Только вход (email + пароль). Регистрации и писем нет: аккаунт создаётся
+ * вручную в Supabase → Authentication → Users → Add user.
+ */
 export function AuthScreen({ onAuthed, onLocalOnly }: { onAuthed: () => void; onLocalOnly?: () => void }) {
-  const [mode, setMode] = useState<Mode>('signin')
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [show, setShow] = useState(false)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [info, setInfo] = useState<string | null>(null)
 
-  const strength = mode === 'signup' ? checkPassword(password) : null
   const emailOk = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())
-  const canSubmit = mode === 'reset'
-    ? emailOk
-    : emailOk && password.length > 0 && (mode === 'signin' || strength!.ok)
+  const canSubmit = emailOk && password.length > 0
 
   async function submit() {
     if (busy || !canSubmit) return
-    setBusy(true); setError(null); setInfo(null)
+    setBusy(true); setError(null)
     try {
-      if (mode === 'reset') {
-        const r = await requestPasswordReset(email)
-        if (!r.ok) setError(r.error ?? 'Не получилось')
-        else setInfo('Письмо для сброса отправлено — проверьте почту')
-        return
-      }
-      const r = mode === 'signin' ? await signIn(email, password) : await signUp(email, password)
+      const r = await signIn(email, password)
       if (!r.ok) { setError(r.error ?? 'Не получилось войти'); return }
-      if (r.needsConfirmation) {
-        setInfo('Аккаунт создан. Подтвердите email по ссылке из письма, затем войдите.')
-        setMode('signin')
-        return
-      }
       onAuthed()
     } catch (e) {
       console.error('[auth]', e)
@@ -56,9 +40,7 @@ export function AuthScreen({ onAuthed, onLocalOnly }: { onAuthed: () => void; on
           <div className="text-6xl mb-4">💰</div>
           <h1 className="text-text-primary text-3xl font-bold">FinFlow</h1>
           <p className="text-text-secondary text-sm mt-2">
-            {mode === 'signin' && 'Войдите, чтобы данные синхронизировались между устройствами'}
-            {mode === 'signup' && 'Создайте аккаунт — ваши финансы будут видны только вам'}
-            {mode === 'reset' && 'Отправим ссылку для сброса пароля'}
+            Войдите, чтобы данные синхронизировались между устройствами
           </p>
         </div>
 
@@ -70,74 +52,36 @@ export function AuthScreen({ onAuthed, onLocalOnly }: { onAuthed: () => void; on
             className={inputCls}
           />
 
-          {mode !== 'reset' && (
-            <div className="relative">
-              <input
-                type={show ? 'text' : 'password'}
-                autoComplete={mode === 'signin' ? 'current-password' : 'new-password'}
-                placeholder="Пароль"
-                value={password} onChange={e => setPassword(e.target.value)}
-                onKeyDown={e => { if (e.key === 'Enter') void submit() }}
-                className={`${inputCls} pr-12`}
-              />
-              <button type="button" onClick={() => setShow(s => !s)}
-                aria-label={show ? 'Скрыть пароль' : 'Показать пароль'}
-                className="absolute right-3 top-1/2 -translate-y-1/2 text-text-muted p-1">
-                {show ? <EyeOff size={18} /> : <Eye size={18} />}
-              </button>
-            </div>
-          )}
-
-          {mode === 'signup' && password.length > 0 && strength && (
-            <div className="flex flex-col gap-1.5">
-              <div className="flex gap-1">
-                {[0, 1, 2, 3].map(i => (
-                  <div key={i} className={`h-1 flex-1 rounded-full ${
-                    i < strength.score ? STRENGTH_COLORS[strength.score] : 'bg-bg-card2'}`} />
-                ))}
-              </div>
-              <p className={`text-xs ${strength.ok ? 'text-text-muted' : 'text-accent-yellow'}`}>
-                {strength.message}
-              </p>
-            </div>
-          )}
+          <div className="relative">
+            <input
+              type={show ? 'text' : 'password'}
+              autoComplete="current-password"
+              placeholder="Пароль"
+              value={password} onChange={e => setPassword(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter') void submit() }}
+              className={`${inputCls} pr-12`}
+            />
+            <button type="button" onClick={() => setShow(s => !s)}
+              aria-label={show ? 'Скрыть пароль' : 'Показать пароль'}
+              className="absolute right-3 top-1/2 -translate-y-1/2 text-text-muted p-1">
+              {show ? <EyeOff size={18} /> : <Eye size={18} />}
+            </button>
+          </div>
 
           {error && <p className="text-accent-red text-xs">{error}</p>}
-          {info && <p className="text-accent-green text-xs">{info}</p>}
 
           <button onClick={submit} disabled={!canSubmit || busy} className={`${primaryBtn} flex items-center justify-center gap-2`}>
             {busy && <Loader2 size={16} className="animate-spin" />}
-            {mode === 'signin' ? 'Войти' : mode === 'signup' ? 'Создать аккаунт' : 'Отправить ссылку'}
+            Войти
           </button>
         </div>
 
-        <div className="flex flex-col gap-2 text-center text-xs">
-          {mode === 'signin' && (
-            <>
-              <button onClick={() => { setMode('signup'); setError(null) }} className="text-accent">
-                Нет аккаунта? Зарегистрироваться
-              </button>
-              <button onClick={() => { setMode('reset'); setError(null) }} className="text-text-muted">
-                Забыли пароль?
-              </button>
-            </>
-          )}
-          {mode !== 'signin' && (
-            <button onClick={() => { setMode('signin'); setError(null) }} className="text-accent">
-              ← Назад ко входу
-            </button>
-          )}
-          {onLocalOnly && (
-            <button onClick={onLocalOnly} className="text-text-muted mt-2">
-              Продолжить без аккаунта (только на этом устройстве)
-            </button>
-          )}
-        </div>
+        {onLocalOnly && (
+          <button onClick={onLocalOnly} className="text-text-muted text-xs">
+            Продолжить без аккаунта (только на этом устройстве)
+          </button>
+        )}
 
-        <p className="text-text-muted text-[11px] text-center leading-relaxed">
-          Пароль проверяется и хранится на стороне Supabase в виде bcrypt-хэша.
-          В приложение и в базу финансов он не попадает.
-        </p>
         {supabaseHost && (
           <p className="text-text-muted/60 text-[10px] text-center">Сервер: {supabaseHost}</p>
         )}
