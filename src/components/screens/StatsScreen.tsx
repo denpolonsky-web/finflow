@@ -13,6 +13,8 @@ import { getRange, periodProgress } from '../../utils/period'
 import {
   totals, byCategory, byDay, budgetRows, forecastExpense, detectSubscriptions,
 } from '../../utils/analytics'
+import { useProfile } from '../../store/ProfileContext'
+import { AnalyticsScreen } from './AnalyticsScreen'
 import type { PeriodId } from '../../types'
 
 const PERIODS: { id: PeriodId; label: string }[] = [
@@ -22,13 +24,14 @@ const PERIODS: { id: PeriodId; label: string }[] = [
   { id: 'year', label: 'Год' },
 ]
 
-type View = 'overview' | 'categories' | 'budgets' | 'trends'
+type View = 'overview' | 'categories' | 'budgets' | 'trends' | 'builder'
 
 const VIEWS: { id: View; label: string }[] = [
   { id: 'overview', label: 'Обзор' },
   { id: 'categories', label: 'Категории' },
   { id: 'budgets', label: 'Бюджеты' },
   { id: 'trends', label: 'Тренды' },
+  { id: 'builder', label: 'Конструктор' },
 ]
 
 const tooltipStyle = {
@@ -37,6 +40,7 @@ const tooltipStyle = {
 }
 
 export function StatsScreen() {
+  const { scope } = useProfile()
   const [period, setPeriod] = useState<PeriodId>('month')
   const [offset, setOffset] = useState(0)
   const [view, setView] = useState<View>('overview')
@@ -44,18 +48,22 @@ export function StatsScreen() {
   const range = useMemo(() => getRange(period, offset), [period, offset])
   const prevRange = useMemo(() => getRange(period, offset - 1), [period, offset])
 
-  const txs = useLiveQuery(
+  const rawTxs = useLiveQuery(
     () => db.transactions.where('date')
       .between(range.from.toISOString(), range.to.toISOString(), true, true).toArray(),
     [range.from.getTime(), range.to.getTime()], [],
   )
-  const prevTxs = useLiveQuery(
+  const rawPrevTxs = useLiveQuery(
     () => db.transactions.where('date')
       .between(prevRange.from.toISOString(), prevRange.to.toISOString(), true, true).toArray(),
     [prevRange.from.getTime(), prevRange.to.getTime()], [],
   )
-  const allTxs = useLiveQuery(() => db.transactions.toArray(), [], [])
+  const rawAllTxs = useLiveQuery(() => db.transactions.toArray(), [], [])
   const budgets = useLiveQuery(() => db.budgets.toArray(), [], [])
+
+  const txs = useMemo(() => scope(rawTxs), [rawTxs, scope])
+  const prevTxs = useMemo(() => scope(rawPrevTxs), [rawPrevTxs, scope])
+  const allTxs = useMemo(() => scope(rawAllTxs), [rawAllTxs, scope])
 
   const t = totals(txs)
   const prevT = totals(prevTxs)
@@ -88,6 +96,19 @@ export function StatsScreen() {
     <div className="flex flex-col gap-4 pb-28">
       <h1 className="text-text-primary text-2xl font-bold">Аналитика</h1>
 
+      <div className="flex bg-bg-card border border-border rounded-2xl p-1 overflow-x-auto scrollbar-none">
+        {VIEWS.map(v => (
+          <button key={v.id} onClick={() => setView(v.id)}
+            className={`flex-1 min-w-[72px] py-2 rounded-xl text-xs font-semibold transition-all ${
+              view === v.id ? 'bg-accent text-white' : 'text-text-secondary'}`}>
+            {v.label}
+          </button>
+        ))}
+      </div>
+
+      {view === 'builder' && <AnalyticsScreen />}
+
+      {view !== 'builder' && (<>
       <div className="flex gap-2 overflow-x-auto pb-1 scrollbar-none">
         {PERIODS.map(p => (
           <button key={p.id} onClick={() => { setPeriod(p.id); setOffset(0) }}
@@ -109,16 +130,6 @@ export function StatsScreen() {
           className="w-9 h-9 rounded-xl bg-bg-card2 flex items-center justify-center text-text-secondary disabled:opacity-30">
           <ChevronRight size={18} />
         </button>
-      </div>
-
-      <div className="flex bg-bg-card border border-border rounded-2xl p-1">
-        {VIEWS.map(v => (
-          <button key={v.id} onClick={() => setView(v.id)}
-            className={`flex-1 py-2 rounded-xl text-xs font-semibold transition-all ${
-              view === v.id ? 'bg-accent text-white' : 'text-text-secondary'}`}>
-            {v.label}
-          </button>
-        ))}
       </div>
 
       {/* ── ОБЗОР ── */}
@@ -375,6 +386,7 @@ export function StatsScreen() {
       )}
 
       {txs.length === 0 && view !== 'budgets' && <Empty />}
+      </>)}
     </div>
   )
 }

@@ -34,7 +34,13 @@ export async function hasPending(entityId: string): Promise<boolean> {
   return (await db.syncQueue.where('entityId').equals(entityId).count()) > 0
 }
 
+/**
+ * Id, по которым есть ЖИВЫЕ неотправленные изменения — их pull не трогает.
+ * «Мёртвые» (dead=1) элементы намеренно НЕ блокируют pull: такая запись уже
+ * никогда не уедет наверх, и если её блокировать — строка залипает локально
+ * навсегда и расходится с другими устройствами. Пусть победит облако.
+ */
 export async function pendingIds(): Promise<Set<string>> {
-  const items = await db.syncQueue.toArray()
+  const items = await db.syncQueue.where('dead').equals(0).toArray()
   return new Set(items.map(i => i.entityId))
 }

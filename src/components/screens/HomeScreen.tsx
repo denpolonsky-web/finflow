@@ -1,3 +1,4 @@
+import { useMemo } from 'react'
 import { useLiveQuery } from 'dexie-react-hooks'
 import { TrendingUp, TrendingDown, Settings, AlertTriangle } from 'lucide-react'
 import { db } from '../../db'
@@ -9,30 +10,29 @@ import { useApp } from '../../store/AppContext'
 import { useAccounts, useBalances, liquidTotal, netWorth } from '../../hooks/useBalances'
 import { bankPreset, availableCredit } from '../../db/accounts'
 import { buildPlan } from '../../db/goals'
+import { useProfile } from '../../store/ProfileContext'
 
 export function HomeScreen() {
   const { setActiveTab, setEditTx } = useApp()
+  const { canSeeAll, profile, scope } = useProfile()
   const accounts = useAccounts()
   const balances = useBalances()
   const settings = useLiveQuery(() => db.settings.get(1), [])
 
   const month = getRange('month', 0)
-  const prevMonth = getRange('month', -1)
 
-  const monthTx = useLiveQuery(
+  const rawMonthTx = useLiveQuery(
     () => db.transactions.where('date')
       .between(month.from.toISOString(), month.to.toISOString(), true, true).toArray(),
     [month.from.getTime()],
     [],
   )
-  const prevTx = useLiveQuery(
-    () => db.transactions.where('date')
-      .between(prevMonth.from.toISOString(), prevMonth.to.toISOString(), true, true).toArray(),
-    [prevMonth.from.getTime()],
-    [],
-  )
-  const allTx = useLiveQuery(() => db.transactions.toArray(), [], [])
-  const recent = useLiveQuery(() => db.transactions.orderBy('date').reverse().limit(5).toArray(), [], [])
+  const rawAllTx = useLiveQuery(() => db.transactions.toArray(), [], [])
+  const rawRecent = useLiveQuery(() => db.transactions.orderBy('date').reverse().limit(40).toArray(), [], [])
+
+  const monthTx = useMemo(() => scope(rawMonthTx), [rawMonthTx, scope])
+  const allTx = useMemo(() => scope(rawAllTx), [rawAllTx, scope])
+  const recent = useMemo(() => scope(rawRecent).slice(0, 5), [rawRecent, scope])
   const goals = useLiveQuery(
     () => db.goals.toArray().then(l => l.filter(g => !g.isArchived).slice(0, 2)),
     [], [],
@@ -44,7 +44,16 @@ export function HomeScreen() {
   const t = totals(monthTx)
   const burn = monthlyBurn(allTx, settings?.runwayWindowMonths ?? 3)
   const runway = runwayMonths(liquid, burn)
-  const alerts = anomalies(monthTx, [prevTx])
+  const history = useMemo(() => {
+    const out: typeof allTx[] = []
+    for (let i = 1; i <= 3; i++) {
+      const r = getRange('month', -i)
+      const from = r.from.toISOString(), to = r.to.toISOString()
+      out.push(allTx.filter(x => x.date >= from && x.date <= to))
+    }
+    return out
+  }, [allTx])
+  const alerts = anomalies(monthTx, history)
 
   return (
     <div className="flex flex-col gap-5 pb-28">
@@ -61,13 +70,17 @@ export function HomeScreen() {
         </button>
       </div>
 
-      {/* Общий итог */}
+      {/* Общий итог. Вторая роль баланс кабинета не видит — только свои траты. */}
       <div className="relative overflow-hidden rounded-3xl bg-gradient-to-br from-accent to-indigo-500 p-6">
         <div className="absolute -top-8 -right-8 w-40 h-40 rounded-full bg-white/5" />
         <div className="absolute -bottom-10 -left-4 w-32 h-32 rounded-full bg-white/5" />
-        <p className="text-white/70 text-sm mb-1">Всего на счетах</p>
-        <p className="text-white text-4xl font-bold tracking-tight">{formatMoney(net)}</p>
-        {liquid !== net && (
+        <p className="text-white/70 text-sm mb-1">
+          {canSeeAll ? 'Всего на счетах' : `Мои расходы за месяц · ${profile?.name ?? ''}`}
+        </p>
+        <p className="text-white text-4xl font-bold tracking-tight">
+          {canSeeAll ? formatMoney(net) : formatMoney(t.expense)}
+        </p>
+        {canSeeAll && liquid !== net && (
           <p className="text-white/60 text-xs mt-1">Доступно сейчас: {formatMoney(liquid)}</p>
         )}
         <div className="flex gap-6 mt-4">
@@ -92,7 +105,8 @@ export function HomeScreen() {
         </div>
       </div>
 
-      {/* Ключевые показатели */}
+      {/* Ключевые показатели — завязаны на общий баланс кабинета */}
+      {canSeeAll && (
       <div className="grid grid-cols-2 gap-2">
         <div className="bg-bg-card border border-border rounded-2xl p-3">
           <p className="text-text-muted text-[10px]">Норма сбережений</p>
@@ -113,6 +127,7 @@ export function HomeScreen() {
           </p>
         </div>
       </div>
+      )}
 
       {alerts.length > 0 && (
         <div className="bg-accent-yellow/10 border border-accent-yellow/20 rounded-2xl p-4 flex gap-3">
@@ -128,7 +143,8 @@ export function HomeScreen() {
         </div>
       )}
 
-      {/* Счета */}
+      {/* Счета с остатками — только главной роли */}
+      {canSeeAll && (
       <div>
         <div className="flex items-center justify-between mb-3">
           <p className="text-text-secondary text-xs uppercase tracking-widest">Счета</p>
@@ -160,6 +176,7 @@ export function HomeScreen() {
           </div>
         )}
       </div>
+      )}
 
       {/* Последние операции */}
       <div>
@@ -196,7 +213,7 @@ export function HomeScreen() {
       </div>
 
       {/* Цели */}
-      {goals.length > 0 && (
+      {canSeeAll && goals.length > 0 && (
         <div>
           <div className="flex items-center justify-between mb-3">
             <p className="text-text-secondary text-xs uppercase tracking-widest">Цели</p>

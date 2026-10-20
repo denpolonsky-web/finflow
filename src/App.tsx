@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { CloudOff, RefreshCw, AlertTriangle } from 'lucide-react'
 import { AppProvider, useApp } from './store/AppContext'
+import { ProfileProvider, useProfile } from './store/ProfileContext'
 import { ErrorBoundary } from './components/ErrorBoundary'
 import { BottomNav } from './components/layout/BottomNav'
 import { HomeScreen } from './components/screens/HomeScreen'
@@ -12,7 +13,9 @@ import { SettingsScreen } from './components/screens/SettingsScreen'
 import { TransactionSheet } from './components/screens/TransactionSheet'
 import { OnboardingScreen } from './components/screens/OnboardingScreen'
 import { AuthScreen } from './components/screens/AuthScreen'
-import { isFirstLaunch } from './db'
+import { ProfileGate } from './components/screens/ProfileGate'
+import { isFirstLaunch, getSettings } from './db'
+import { ensureDefaultProfile } from './db/profiles'
 import { hasSupabase, withTimeout } from './db/supabase'
 import { getSession, onAuthChange, onUserResolved } from './db/auth'
 import { bootstrapSync } from './db/sync'
@@ -69,6 +72,7 @@ function Toast() {
 
 function AppInner() {
   const { activeTab, isAddOpen, closeAdd, editTx, setEditTx } = useApp()
+  const { profile, profiles, loading: profilesLoading, leaveProfile } = useProfile()
   const [phase, setPhase] = useState<Phase>('booting')
   const [splashText, setSplashText] = useState('Запуск…')
   const [authed, setAuthed] = useState(false)
@@ -99,6 +103,12 @@ function AppInner() {
         await withTimeout(bootstrapSync(), 15_000, 'bootstrapSync')
       }
 
+      // основной подпрофиль должен существовать всегда: и на свежей установке,
+      // и на аккаунте, куда профили ещё не приехали из облака
+      if (!(await isFirstLaunch())) {
+        await ensureDefaultProfile((await getSettings())?.userName)
+      }
+
       setPhase((await isFirstLaunch()) ? 'onboarding' : 'ready')
     } catch (e) {
       console.error('[boot]', e)
@@ -117,6 +127,13 @@ function AppInner() {
     if (!session && hasSupabase && !localOnly) { setAuthed(false); setPhase('auth') }
   }), [localOnly])
 
+  // Страховка: кабинет без единого профиля — создаём основной.
+  // Выбор «кто пользуется» живёт в ProfileContext и считается при рендере.
+  useEffect(() => {
+    if (phase !== 'ready' || profilesLoading || profiles.length > 0) return
+    void ensureDefaultProfile()
+  }, [phase, profilesLoading, profiles.length])
+
   if (phase === 'booting') return <Splash text={splashText} />
 
   if (phase === 'auth') {
@@ -133,8 +150,11 @@ function AppInner() {
   }
 
   if (phase === 'onboarding') {
-    return <OnboardingScreen onDone={() => setPhase('ready')} />
+    return <OnboardingScreen onDone={() => { void ensureDefaultProfile(); setPhase('ready') }} />
   }
+
+  if (profilesLoading) return <Splash text="Загружаем профили…" />
+  if (!profile) return <ProfileGate />
 
   return (
     <div className="min-h-dvh bg-bg-primary text-text-primary">
@@ -152,10 +172,12 @@ function AppInner() {
             dead={sync.dead}
             lastError={sync.lastError}
             onSync={sync.syncNow}
+            onSwitchProfile={leaveProfile}
             onSignedOut={() => {
               localStorage.removeItem(LOCAL_ONLY_KEY)
               setLocalOnly(false)
               setAuthed(false)
+              leaveProfile()
               setPhase('auth')
             }}
           />
@@ -173,7 +195,9 @@ export default function App() {
   return (
     <ErrorBoundary>
       <AppProvider>
-        <AppInner />
+        <ProfileProvider>
+          <AppInner />
+        </ProfileProvider>
       </AppProvider>
     </ErrorBoundary>
   )

@@ -2,7 +2,7 @@ import { db } from './index'
 import { categoryName } from './categories'
 import { toMajor } from '../utils/money'
 
-function download(name: string, content: string, mime: string) {
+export function download(name: string, content: string, mime: string) {
   const blob = new Blob([content], { type: `${mime};charset=utf-8` })
   const url = URL.createObjectURL(blob)
   const a = document.createElement('a')
@@ -53,6 +53,7 @@ export async function exportJson(): Promise<void> {
     budgets: await db.budgets.toArray(),
     snapshots: await db.snapshots.toArray(),
     settings: await db.settings.get(1),
+    profiles: await db.profiles.toArray(),
   }
   download(`finflow-backup-${stamp()}.json`, JSON.stringify(dump, null, 2), 'application/json')
 }

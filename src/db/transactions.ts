@@ -2,6 +2,7 @@ import { v4 as uuid } from 'uuid'
 import { db } from './index'
 import { enqueue } from './queue'
 import { TRANSFER_CATEGORY_ID } from './categories'
+import { getActiveProfileId } from './profiles'
 import type { Minor, Posting, Transaction, TransactionType } from '../types'
 
 export interface TxInput {
@@ -15,6 +16,8 @@ export interface TxInput {
   tags?: string[] | null
   date?: string
   goalId?: string | null
+  /** если не передан — берётся активный подпрофиль */
+  profileId?: string | null
   source?: Transaction['source']
   excludeFromStats?: 0 | 1
 }
@@ -66,6 +69,7 @@ export async function addTransaction(input: TxInput): Promise<Transaction> {
     // перевод между своими счетами — не расход и не доход
     excludeFromStats: input.excludeFromStats ?? (input.type === 'transfer' ? 1 : 0),
     goalId: input.goalId ?? null,
+    profileId: input.profileId ?? getActiveProfileId(),
     source: input.source ?? 'manual',
     createdAt: now,
     updatedAt: now,
@@ -110,6 +114,8 @@ export async function updateTransaction(id: string, input: TxInput): Promise<voi
     date,
     excludeFromStats: input.excludeFromStats ?? (input.type === 'transfer' ? 1 : 0),
     goalId: input.goalId ?? null,
+    // владелец операции при редактировании не меняется
+    profileId: input.profileId ?? existing.profileId ?? getActiveProfileId(),
     updatedAt: now,
   }
 

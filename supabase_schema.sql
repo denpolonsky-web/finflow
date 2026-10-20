@@ -36,6 +36,23 @@ create table if not exists accounts (
   deleted_at      timestamptz
 );
 
+-- Подпрофили одного кабинета. Делят user_id — RLS и синхронизация не меняются.
+-- Роль нужна приложению для разграничения интерфейса, база её не проверяет.
+create table if not exists profiles (
+  id          text primary key,
+  user_id     uuid not null default auth.uid() references auth.users(id) on delete cascade,
+  name        text not null default '',
+  emoji       text default '👤',
+  color       text default '#6C63FF',
+  role        text not null default 'member',
+  pin_hash    text,
+  is_archived smallint not null default 0,
+  sort_order  integer not null default 0,
+  created_at  timestamptz not null default now(),
+  updated_at  timestamptz not null default now(),
+  deleted_at  timestamptz
+);
+
 create table if not exists transactions (
   id                 text primary key,
   user_id            uuid not null default auth.uid() references auth.users(id) on delete cascade,
@@ -50,6 +67,7 @@ create table if not exists transactions (
   date               timestamptz not null,
   exclude_from_stats smallint not null default 0,
   goal_id            text,
+  profile_id         text,
   source             text default 'manual',
   created_at         timestamptz not null default now(),
   updated_at         timestamptz not null default now(),
@@ -124,7 +142,12 @@ create table if not exists app_settings (
 
 -- ── Индексы ──────────────────────────────────────────────────────────────
 
+-- Колонка профиля для баз, созданных до версии 4.
+alter table transactions add column if not exists profile_id text;
+
 create index if not exists idx_tx_user_updated   on transactions (user_id, updated_at);
+create index if not exists idx_tx_user_profile   on transactions (user_id, profile_id);
+create index if not exists idx_prof_user_updated on profiles (user_id, updated_at);
 create index if not exists idx_tx_user_date      on transactions (user_id, date desc);
 create index if not exists idx_post_user_updated on postings (user_id, updated_at);
 create index if not exists idx_post_account      on postings (user_id, account_id);
@@ -148,9 +171,9 @@ end $$;
 do $$
 declare t text;
 begin
-  foreach t in array array['accounts','transactions','postings','goals','budgets','balance_snapshots','app_settings'] loop
+  foreach t in array array['accounts','transactions','postings','goals','budgets','balance_snapshots','app_settings','profiles'] loop
     execute format('drop trigger if exists trg_%1$s_updated on %1$I', t);
-    execute format('create trigger trg_%1$s_updated before update on %1$I for each row execute function set_updated_at()', t);
+    execute format('create trigger trg_%1$s_updated before insert or update on %1$I for each row execute function set_updated_at()', t);
   end loop;
 end $$;
 
@@ -159,7 +182,7 @@ end $$;
 do $$
 declare t text;
 begin
-  foreach t in array array['accounts','transactions','postings','goals','budgets','balance_snapshots','app_settings'] loop
+  foreach t in array array['accounts','transactions','postings','goals','budgets','balance_snapshots','app_settings','profiles'] loop
     execute format('alter table %I enable row level security', t);
     execute format('alter table %I force row level security', t);
 
@@ -190,7 +213,7 @@ create or replace function purge_tombstones() returns void
 language plpgsql security definer as $$
 declare t text;
 begin
-  foreach t in array array['accounts','transactions','postings','goals','budgets','balance_snapshots'] loop
+  foreach t in array array['accounts','transactions','postings','goals','budgets','balance_snapshots','profiles'] loop
     execute format('delete from %I where deleted_at is not null and deleted_at < now() - interval ''90 days''', t);
   end loop;
 end $$;

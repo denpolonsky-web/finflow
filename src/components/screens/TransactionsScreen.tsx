@@ -8,6 +8,7 @@ import { getRange } from '../../utils/period'
 import { totals } from '../../utils/analytics'
 import { useApp } from '../../store/AppContext'
 import { useAccounts } from '../../hooks/useBalances'
+import { useProfile } from '../../store/ProfileContext'
 import type { PeriodId, Transaction } from '../../types'
 
 const PERIODS: { id: PeriodId; label: string }[] = [
@@ -21,22 +22,27 @@ type Filter = 'all' | 'expense' | 'income' | 'transfer'
 
 export function TransactionsScreen() {
   const { setEditTx } = useApp()
+  const { profiles, canSeeAll, scope } = useProfile()
   const [period, setPeriod] = useState<PeriodId>('month')
   const [offset, setOffset] = useState(0)
   const [search, setSearch] = useState('')
   const [filter, setFilter] = useState<Filter>('all')
   const [accountFilter, setAccountFilter] = useState<string>('')
+  const [profileFilter, setProfileFilter] = useState<string>('')
 
   const accounts = useAccounts(true)
   const range = useMemo(() => getRange(period, offset), [period, offset])
 
-  const transactions = useLiveQuery(
+  const rawTransactions = useLiveQuery(
     () => db.transactions.where('date')
       .between(range.from.toISOString(), range.to.toISOString(), true, true)
       .reverse().sortBy('date'),
     [range.from.getTime(), range.to.getTime()],
     [],
   )
+
+  // видимость по роли применяется до пользовательских фильтров
+  const transactions = useMemo(() => scope(rawTransactions), [rawTransactions, scope])
 
   const filtered = useMemo(() => transactions.filter(tx => {
     const q = search.trim().toLowerCase()
@@ -46,8 +52,9 @@ export function TransactionsScreen() {
       || (tx.comment ?? '').toLowerCase().includes(q)
     const matchType = filter === 'all' || tx.type === filter
     const matchAccount = !accountFilter || tx.accountId === accountFilter || tx.toAccountId === accountFilter
-    return matchSearch && matchType && matchAccount
-  }), [transactions, search, filter, accountFilter])
+    const matchProfile = !profileFilter || tx.profileId === profileFilter
+    return matchSearch && matchType && matchAccount && matchProfile
+  }), [transactions, search, filter, accountFilter, profileFilter])
 
   const grouped = useMemo(() => {
     const acc: Record<string, Transaction[]> = {}
@@ -108,6 +115,13 @@ export function TransactionsScreen() {
             className="flex-none bg-bg-card text-text-muted border border-border rounded-lg text-xs px-2 py-1.5 outline-none">
             <option value="">Все счета</option>
             {accounts?.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
+          </select>
+        )}
+        {canSeeAll && profiles.length > 1 && (
+          <select value={profileFilter} onChange={e => setProfileFilter(e.target.value)}
+            className="flex-none bg-bg-card text-text-muted border border-border rounded-lg text-xs px-2 py-1.5 outline-none">
+            <option value="">Все профили</option>
+            {profiles.map(p => <option key={p.id} value={p.id}>{p.emoji} {p.name}</option>)}
           </select>
         )}
       </div>

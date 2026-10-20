@@ -2,19 +2,25 @@ import { useState } from 'react'
 import { useLiveQuery } from 'dexie-react-hooks'
 import {
   ArrowLeft, Download, FileJson, LogOut, RefreshCw, CloudOff, Cloud, AlertTriangle, Trash2,
+  Users, Plus, Lock, Pencil, Repeat,
 } from 'lucide-react'
 import { db, getMeta } from '../../db'
 import { selectableCategories, categoryIcon, categoryName } from '../../db/categories'
 import { setBudget } from '../../db/budgets'
 import { exportCsv, exportJson } from '../../db/exportData'
+import { enqueue } from '../../db/queue'
 import { signOut } from '../../db/auth'
 import { hasSupabase } from '../../db/supabase'
 import { pushAll } from '../../db/sync'
 import { formatMoney } from '../../utils/format'
 import { toMinor } from '../../utils/money'
 import { useApp } from '../../store/AppContext'
+import { useProfile } from '../../store/ProfileContext'
+import { ROLE_RIGHTS } from '../../db/profiles'
+import { ProfileSheet } from './ProfileSheet'
 import { inputCls } from '../ui/Sheet'
 import type { SyncStatus } from '../../hooks/useSync'
+import type { Profile } from '../../types'
 
 interface Props {
   syncStatus: SyncStatus
@@ -23,10 +29,14 @@ interface Props {
   lastError: string | null
   onSync: () => void
   onSignedOut: () => void
+  onSwitchProfile: () => void
 }
 
-export function SettingsScreen({ syncStatus, pending, dead, lastError, onSync, onSignedOut }: Props) {
+export function SettingsScreen({ syncStatus, pending, dead, lastError, onSync, onSignedOut, onSwitchProfile }: Props) {
   const { setActiveTab, showToast } = useApp()
+  const { profiles, profile: me, canSeeAll } = useProfile()
+  const [editProfile, setEditProfile] = useState<Profile | null>(null)
+  const [creating, setCreating] = useState(false)
   const settings = useLiveQuery(() => db.settings.get(1), [])
   const budgets = useLiveQuery(() => db.budgets.toArray(), [], [])
   const deadItems = useLiveQuery(() => db.syncQueue.where('dead').equals(1).toArray(), [], [])
@@ -47,6 +57,8 @@ export function SettingsScreen({ syncStatus, pending, dead, lastError, onSync, o
     const now = new Date().toISOString()
     const next = { ...(settings ?? { id: 1 as const, currency: 'RUB' as const, theme: 'dark' as const, runwayWindowMonths: 3 }), userName: name.trim(), updatedAt: now }
     await db.settings.put(next)
+    // без enqueue настройки оставались только на этом устройстве
+    await enqueue('settings', 'settings', 'upsert', next)
     showToast('Имя сохранено')
     setName(null)
   }
@@ -175,6 +187,50 @@ export function SettingsScreen({ syncStatus, pending, dead, lastError, onSync, o
         )}
       </section>
 
+      {/* профили */}
+      <section className="bg-bg-card border border-border rounded-2xl p-4 flex flex-col gap-3">
+        <div className="flex items-center justify-between">
+          <p className="text-text-secondary text-xs uppercase tracking-widest flex items-center gap-1.5">
+            <Users size={12} /> Профили
+          </p>
+          <button onClick={onSwitchProfile} className="text-accent text-xs font-medium flex items-center gap-1">
+            <Repeat size={12} /> Сменить
+          </button>
+        </div>
+
+        <div className="flex flex-col gap-2">
+          {profiles.map(p => (
+            <button key={p.id} disabled={!canSeeAll} onClick={() => setEditProfile(p)}
+              className="flex items-center gap-3 bg-bg-card2 rounded-xl px-3 py-2.5 text-left disabled:opacity-100">
+              <span className="w-9 h-9 rounded-full flex items-center justify-center text-lg flex-none"
+                style={{ background: `${p.color}22` }}>{p.emoji}</span>
+              <div className="flex-1 min-w-0">
+                <p className="text-text-primary text-sm font-medium truncate">
+                  {p.name}{p.id === me?.id && <span className="text-text-muted text-[10px]"> · вы</span>}
+                </p>
+                <p className="text-text-muted text-[10px] flex items-center gap-1">
+                  {ROLE_RIGHTS[p.role].label}{p.pinHash && <Lock size={9} />}
+                </p>
+              </div>
+              {canSeeAll && <Pencil size={13} className="text-text-muted flex-none" />}
+            </button>
+          ))}
+        </div>
+
+        {canSeeAll && (
+          <button onClick={() => { setEditProfile(null); setCreating(true) }}
+            className="bg-bg-card2 text-text-primary text-xs font-semibold py-2.5 rounded-xl flex items-center justify-center gap-1.5">
+            <Plus size={14} /> Добавить профиль
+          </button>
+        )}
+
+        <p className="text-text-muted text-[11px] leading-relaxed">
+          Счета и операции общие на весь кабинет, статистика считается по каждому профилю отдельно.
+          Роль разграничивает интерфейс, а не доступ к базе: все профили работают под одним входом,
+          поэтому это защита от случайного взгляда, а не от целенаправленного.
+        </p>
+      </section>
+
       {/* экспорт */}
       <section className="bg-bg-card border border-border rounded-2xl p-4 flex flex-col gap-3">
         <div>
@@ -223,6 +279,14 @@ export function SettingsScreen({ syncStatus, pending, dead, lastError, onSync, o
           </button>
         </p>
       </section>
+
+      {(creating || editProfile) && (
+        <ProfileSheet
+          key={editProfile?.id ?? 'new'}
+          profile={editProfile}
+          onClose={() => { setCreating(false); setEditProfile(null) }}
+        />
+      )}
     </div>
   )
 }

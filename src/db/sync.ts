@@ -11,6 +11,7 @@ const TABLE: Record<SyncEntity, string> = {
   budget: 'budgets',
   snapshot: 'balance_snapshots',
   settings: 'app_settings',
+  profile: 'profiles',
 }
 
 const LOCAL_TABLE: Record<SyncEntity, string> = {
@@ -21,6 +22,7 @@ const LOCAL_TABLE: Record<SyncEntity, string> = {
   budget: 'budgets',
   snapshot: 'snapshots',
   settings: 'settings',
+  profile: 'profiles',
 }
 
 const MAX_RETRIES = 5
@@ -117,27 +119,42 @@ export async function push(): Promise<{ pushed: number; failed: number; dead: nu
 // PULL
 // ─────────────────────────────────────────────────────────────────────────────
 
-const PULL_ORDER: SyncEntity[] = ['settings', 'account', 'goal', 'budget', 'transaction', 'posting', 'snapshot']
+const PULL_ORDER: SyncEntity[] = ['settings', 'profile', 'account', 'goal', 'budget', 'transaction', 'posting', 'snapshot']
 const PAGE = 1000
 
 /**
- * Инкрементальный pull по updated_at. Три принципиальных отличия от прошлой версии:
- *  1. не `bulkPut` вслепую — локальная запись не перезаписывается, если она свежее
- *     или если по ней есть неотправленные изменения;
- *  2. приходят и удалённые строки (deleted_at) — значит удаление доезжает;
- *  3. нет лимита 500 — страницы идут, пока не кончатся.
+ * Инкрементальный pull по updated_at.
+ *
+ * Водяной знак (watermark) теперь СВОЙ У КАЖДОЙ ТАБЛИЦЫ и сдвигается только если
+ * таблица прокачалась до конца без ошибок. Раньше знак был общий и записывался
+ * безусловно: если postings отвалились по таймауту, а transactions прошли,
+ * знак уезжал вперёд — и эти postings не приезжали на устройство НИКОГДА.
+ * Это и есть главный сценарий «на телефоне операции есть, на ноуте нет».
  */
-export async function pull(): Promise<number> {
-  if (!hasSupabase || !navigator.onLine) return 0
-  const since = (await getMeta('lastPullAt')) ?? '1970-01-01T00:00:00.000Z'
+export interface PullReport { pulled: number; error?: string }
+
+const WM_PREFIX = 'pullAt:'
+
+async function watermark(entity: SyncEntity): Promise<string> {
+  // старый общий ключ используем как стартовое значение, чтобы не перекачивать всё заново
+  return (await getMeta(WM_PREFIX + entity))
+    ?? (await getMeta('lastPullAt'))
+    ?? '1970-01-01T00:00:00.000Z'
+}
+
+export async function pull(): Promise<PullReport> {
+  if (!hasSupabase || !navigator.onLine) return { pulled: 0 }
   const blocked = await pendingIds()
   let total = 0
-  let newest = since
+  const errors: string[] = []
 
   for (const entity of PULL_ORDER) {
     const remote = TABLE[entity]
     const local = LOCAL_TABLE[entity]
+    const since = await watermark(entity)
+    let newest = since
     let from = 0
+    let clean = true
 
     for (;;) {
       const query = supabase!.from(remote).select('*').gt('updated_at', since)
@@ -146,8 +163,8 @@ export async function pull(): Promise<number> {
         Promise.resolve(query) as Promise<{ data: unknown; error: { message: string } | null }>,
         20_000, `pull ${remote}`,
       )
-      if (!res) { console.warn('[pull] таймаут на', remote); break }
-      if (res.error) { console.error('[pull]', remote, res.error.message); break }
+      if (!res) { console.warn('[pull] таймаут на', remote); errors.push(`${remote}: таймаут`); clean = false; break }
+      if (res.error) { console.error('[pull]', remote, res.error.message); errors.push(`${remote}: ${res.error.message}`); clean = false; break }
 
       const rows = (res.data ?? []) as Record<string, unknown>[]
       if (!rows.length) break
@@ -166,7 +183,10 @@ export async function pull(): Promise<number> {
 
         if (entity === 'settings') row.id = 1
 
-        if (blocked.has(String(id))) continue           // локально есть неотправленные правки
+        // у настроек локальный ключ 1, а в очереди он лежит под строкой 'settings' —
+        // без этого несохранённые настройки затирались приходящими из облака
+        const queueKey = entity === 'settings' ? 'settings' : String(id)
+        if (blocked.has(queueKey)) continue              // локально есть неотправленные правки
 
         if (row.deletedAt) { toDelete.push(String(id)); continue }
 
@@ -184,19 +204,24 @@ export async function pull(): Promise<number> {
       if (rows.length < PAGE) break
       from += PAGE
     }
+
+    // сдвигаем знак ТОЛЬКО если таблица дочитана целиком: повторно перечитать
+    // страницу дёшево и идемпотентно, потерять строку — нет
+    if (clean && newest > since) await setMeta(WM_PREFIX + entity, newest)
   }
 
-  await setMeta('lastPullAt', newest)
-  return total
+  return { pulled: total, error: errors.length ? errors.join('; ') : undefined }
 }
 
 /** Полная отправка всего локального состояния — после первого входа на устройстве. */
 export async function pushAll(): Promise<number> {
-  const [accounts, transactions, postings, goals, budgets, snapshots, settings] = await Promise.all([
+  const [accounts, transactions, postings, goals, budgets, snapshots, settings, profiles] = await Promise.all([
     db.accounts.toArray(), db.transactions.toArray(), db.postings.toArray(),
     db.goals.toArray(), db.budgets.toArray(), db.snapshots.toArray(), db.settings.get(1),
+    db.profiles.toArray(),
   ])
   let n = 0
+  for (const pr of profiles) { await enqueue('profile', pr.id, 'upsert', pr); n++ }
   for (const a of accounts) { await enqueue('account', a.id, 'upsert', a); n++ }
   for (const g of goals) { await enqueue('goal', g.id, 'upsert', g); n++ }
   for (const b of budgets) { await enqueue('budget', b.id, 'upsert', b); n++ }
@@ -212,8 +237,10 @@ export async function syncNow(): Promise<SyncReport> {
   if (!navigator.onLine) return { pushed: 0, pulled: 0, failed: 0, dead: 0, error: 'offline' }
   try {
     const p = await push()                              // сначала отдаём своё
-    const pulled = await pull()                         // затем забираем чужое
-    return { ...p, pulled }
+    const r = await pull()                              // затем забираем чужое
+    // ошибку pull'а больше не глотаем: иначе статус «online» врал,
+    // хотя половина таблиц не приехала
+    return { ...p, pulled: r.pulled, error: r.error }
   } catch (e) {
     console.error('[sync]', e)
     return { pushed: 0, pulled: 0, failed: 0, dead: 0, error: String(e) }

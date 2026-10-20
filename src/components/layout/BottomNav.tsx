@@ -1,6 +1,7 @@
 import { Home, List, BarChart3, Plus, Wallet, Target } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
 import { useApp } from '../../store/AppContext'
+import { useProfile } from '../../store/ProfileContext'
 import type { TabId } from '../../types'
 
 const TABS: { id: TabId; icon: LucideIcon; label: string }[] = [
@@ -13,8 +14,12 @@ const TABS: { id: TabId; icon: LucideIcon; label: string }[] = [
 
 export function BottomNav() {
   const { activeTab, setActiveTab, openAdd } = useApp()
-  const left = TABS.slice(0, 2)
-  const right = TABS.slice(2)
+  const { canSeeAll } = useProfile()
+  // вторая роль не видит остатки и накопления — вкладки со счетами и целями прячем
+  const visible = canSeeAll ? TABS : TABS.filter(t => t.id !== 'accounts' && t.id !== 'goals')
+  const half = Math.ceil(visible.length / 2)
+  const left = visible.slice(0, half)
+  const right = visible.slice(half)
 
   const item = ({ id, icon: Icon, label }: typeof TABS[number]) => (
     <button key={id} onClick={() => setActiveTab(id)}

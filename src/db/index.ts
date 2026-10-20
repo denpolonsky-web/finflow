@@ -2,7 +2,7 @@ import Dexie, { type Table, type Transaction as DexieTx } from 'dexie'
 import { v4 as uuid } from 'uuid'
 import type {
   Account, Transaction, Posting, Goal, Budget,
-  BalanceSnapshot, AppSettings, SyncQueueItem, MetaRow,
+  BalanceSnapshot, AppSettings, SyncQueueItem, MetaRow, Profile,
 } from '../types'
 
 /**
@@ -20,6 +20,7 @@ class FinFlowDB extends Dexie {
   settings!: Table<AppSettings, number>
   syncQueue!: Table<SyncQueueItem, string>
   meta!: Table<MetaRow, string>
+  profiles!: Table<Profile, string>
 
   constructor() {
     super('FinFlowDB')
@@ -61,6 +62,14 @@ class FinFlowDB extends Dexie {
         recurringPayments: null,
       })
       .upgrade(migrateV2toV3)
+
+    // v4 — подпрофили внутри одного аккаунта.
+    this.version(4)
+      .stores({
+        profiles: 'id, role, isArchived, sortOrder, updatedAt',
+        transactions: 'id, type, categoryId, accountId, toAccountId, date, goalId, excludeFromStats, profileId, updatedAt, deletedAt',
+      })
+      .upgrade(migrateV3toV4)
   }
 }
 
@@ -194,6 +203,41 @@ async function migrateV2toV3(tx: DexieTx) {
   })
 }
 
+/**
+ * Первый подпрофиль получает ФИКСИРОВАННЫЙ id. Это важно: миграция проходит
+ * на каждом устройстве независимо, и случайный uuid породил бы два «основных»
+ * профиля, которые потом склеились бы в облаке в мусор.
+ */
+export const PRIMARY_PROFILE_ID = 'primary'
+
+async function migrateV3toV4(tx: DexieTx) {
+  const now = new Date().toISOString()
+  const settings = await tx.table('settings').get(1).catch(() => undefined)
+
+  await tx.table('profiles').put({
+    id: PRIMARY_PROFILE_ID,
+    name: (settings as { userName?: string } | undefined)?.userName?.trim() || 'Основной',
+    emoji: '👤',
+    color: '#6C63FF',
+    role: 'primary',
+    pinHash: null,
+    isArchived: 0,
+    sortOrder: 0,
+    createdAt: now,
+    updatedAt: now,
+    deletedAt: null,
+  })
+
+  // Старые операции принадлежат основному профилю. Присваиваем детерминированно
+  // и НЕ ставим в очередь отправки: на каждом устройстве получится тот же
+  // profileId, так что облако и так сойдётся, а пуш тысяч строк не нужен.
+  await tx.table('transactions').toCollection().modify((t: Record<string, unknown>) => {
+    if (!t.profileId) t.profileId = PRIMARY_PROFILE_ID
+  })
+
+  console.info('[migrate v3→v4] подпрофили включены')
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Настройки / meta
 // ─────────────────────────────────────────────────────────────────────────────
@@ -227,12 +271,13 @@ export async function setMeta(key: string, value: string): Promise<void> {
 export async function wipeLocal(): Promise<void> {
   await db.transaction('rw', [
     db.accounts, db.transactions, db.postings, db.goals,
-    db.budgets, db.snapshots, db.settings, db.syncQueue, db.meta,
+    db.budgets, db.snapshots, db.settings, db.syncQueue, db.meta, db.profiles,
   ], async () => {
     await Promise.all([
       db.accounts.clear(), db.transactions.clear(), db.postings.clear(),
       db.goals.clear(), db.budgets.clear(), db.snapshots.clear(),
       db.settings.clear(), db.syncQueue.clear(), db.meta.clear(),
+      db.profiles.clear(),
     ])
   })
 }

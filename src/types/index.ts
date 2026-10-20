@@ -51,6 +51,30 @@ export interface Account {
   deletedAt?: string | null
 }
 
+/** Роль подпрофиля внутри одного общего кабинета. */
+export type ProfileRole = 'primary' | 'member'
+
+/**
+ * Подпрофиль. Все подпрофили живут ВНУТРИ одного Supabase-аккаунта и делят
+ * один user_id — поэтому синхронизация и RLS не меняются.
+ * ВАЖНО: роль разграничивает интерфейс, а не доступ к данным. Человек с
+ * доступом к устройству и токену технически видит всё.
+ */
+export interface Profile {
+  id: string
+  name: string
+  emoji: string
+  color: string
+  role: ProfileRole
+  /** SHA-256 от пин-кода; null — вход в профиль без пин-кода */
+  pinHash?: string | null
+  isArchived: Flag
+  sortOrder: number
+  createdAt: string
+  updatedAt: string
+  deletedAt?: string | null
+}
+
 export interface Transaction {
   id: string
   type: TransactionType
@@ -66,6 +90,8 @@ export interface Transaction {
   /** переводы между своими счетами и корректировки не идут в расходы/доходы */
   excludeFromStats: Flag
   goalId?: string | null
+  /** какой подпрофиль завёл операцию; null — досталась от миграции */
+  profileId?: string | null
   source: 'manual' | 'reconciliation' | 'goal' | 'import'
   createdAt: string
   updatedAt: string
@@ -138,7 +164,7 @@ export interface AppSettings {
 }
 
 export type SyncEntity =
-  | 'account' | 'transaction' | 'posting' | 'goal' | 'budget' | 'snapshot' | 'settings'
+  | 'account' | 'transaction' | 'posting' | 'goal' | 'budget' | 'snapshot' | 'settings' | 'profile'
 
 export interface SyncQueueItem {
   id: string
