@@ -1,0 +1,36 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * { box-sizing: border-box; }
+  html {
+    -webkit-tap-highlight-color: transparent;
+    font-family: 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
+    color-scheme: dark;
+  }
+  body {
+    overscroll-behavior-y: none;
+    -webkit-font-smoothing: antialiased;
+    background: #0A0A12;
+  }
+  /*
+   * Двойной тап по элементу больше не зумит страницу. Именно manipulation,
+   * а не user-scalable=no во вьюпорте: pinch-to-zoom остаётся доступен,
+   * а двойной тап перестаёт считаться жестом масштабирования.
+   * Побочный плюс — уходит задержка ~300 мс перед click на тач-экранах.
+   */
+  button, a, label, summary, [role="button"], input, select, textarea {
+    touch-action: manipulation;
+  }
+  .scrollbar-none::-webkit-scrollbar { display: none; }
+  .scrollbar-none { -ms-overflow-style: none; scrollbar-width: none; }
+  input, select, textarea, button { font-family: inherit; }
+  /* iOS не зумит поля при фокусе, если размер ≥ 16px */
+  input, select, textarea { font-size: 16px; }
+  select { appearance: none; }
+  input[type="number"]::-webkit-outer-spin-button,
+  input[type="number"]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+}
