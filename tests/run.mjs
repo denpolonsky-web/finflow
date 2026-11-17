@@ -4,7 +4,7 @@ import { build } from 'esbuild'
 import { spawnSync } from 'node:child_process'
 import { rmSync } from 'node:fs'
 
-const files = ['tests/ledger.test.ts', 'tests/migrate.test.ts', 'tests/cloudConfig.test.ts', 'tests/profiles.test.ts', 'tests/sync.test.ts', 'tests/money.test.ts', 'tests/features.test.ts', 'tests/syncE2e.test.ts', 'tests/categories.test.ts', 'tests/txGroups.test.ts']
+const files = ['tests/ledger.test.ts', 'tests/migrate.test.ts', 'tests/cloudConfig.test.ts', 'tests/profiles.test.ts', 'tests/sync.test.ts', 'tests/money.test.ts', 'tests/features.test.ts', 'tests/syncE2e.test.ts', 'tests/categories.test.ts', 'tests/txGroups.test.ts', 'tests/uiLayout.test.ts']
 let failed = 0
 
 for (const entry of files) {

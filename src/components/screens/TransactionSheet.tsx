@@ -2,7 +2,9 @@ import { useEffect, useMemo, useState } from 'react'
 import { ChevronRight, Loader2, Trash2, ArrowRight, Keyboard } from 'lucide-react'
 import { useLiveQuery } from 'dexie-react-hooks'
 import { db } from '../../db'
-import { addTransaction, updateTransaction, deleteTransaction, LedgerError } from '../../db/transactions'
+import {
+  addTransaction, updateTransaction, deleteTransaction, restoreTransaction, LedgerError,
+} from '../../db/transactions'
 import { selectableCategories } from '../../db/categories'
 import { toMinor, groupMoney, minorToInput } from '../../utils/money'
 import { isoToLocalInput, localInputToIso, formatMoney } from '../../utils/format'
@@ -157,14 +159,23 @@ export function TransactionSheet({ tx, onClose }: Props) {
 
   async function remove() {
     if (!tx || busy) return
-    /* Спрашиваем: кнопка стоит сразу под «Сохранить изменения», отмены нет,
-       а удаление снимает проводки и двигает баланс. Промах пальцем стоил бы
-       операции без следа. */
-    if (!confirm(`Удалить операцию на ${formatMoney(tx.amount)}? Отменить это будет нельзя.`)) return
+    /* Спрашиваем: кнопка стоит сразу под «Сохранить изменения», а удаление
+       снимает проводки и двигает баланс. Теперь оно обратимо — операция
+       уходит в корзину, — но вопрос оставлен: вернуть можно, а заметить
+       случайное удаление всё равно сначала надо. */
+    if (!confirm(`Удалить операцию на ${formatMoney(tx.amount)}? Вернуть её можно в «Истории» → «Удалённые».`)) return
     setBusy(true)
     try {
-      await deleteTransaction(tx.id)
-      showToast('Операция удалена, баланс возвращён')
+      const id = tx.id
+      await deleteTransaction(id)
+      showToast('Операция удалена', {
+        label: 'Вернуть',
+        run: () => {
+          restoreTransaction(id)
+            .then(() => showToast('Операция возвращена'))
+            .catch(e => showToast(e instanceof LedgerError ? e.message : 'Не удалось вернуть операцию'))
+        },
+      })
       onClose()
     } catch (e) {
       console.error('[tx delete]', e)

@@ -1,74 +1,72 @@
-﻿import { useMemo, useState } from 'react'
+﻿import { useCallback, useMemo, useState } from 'react'
 import { useLiveQuery } from 'dexie-react-hooks'
-import {
-  PieChart, Pie, Cell, ResponsiveContainer, BarChart, Bar, XAxis, YAxis,
-  Tooltip, LineChart, Line, CartesianGrid, Legend,
-} from 'recharts'
-import { ChevronLeft, ChevronRight, Repeat, SlidersHorizontal } from 'lucide-react'
+import { ChevronLeft, ChevronRight, Pencil, SlidersHorizontal, Check } from 'lucide-react'
 import { db } from '../../db'
-import { categoryColor, categoryName } from '../../db/categories'
-import { CategoryIcon } from '../ui/CategoryIcon'
-import { formatMoney, formatDayKey, formatDateShort, plural } from '../../utils/format'
-import { toMajor } from '../../utils/money'
-import { comparableCutoff, getRange, periodProgress } from '../../utils/period'
-import {
-  totals, byCategory, byDay, byDayBlocks, budgetRows, forecastExpense, detectSubscriptions,
-} from '../../utils/analytics'
 import { useProfile } from '../../store/ProfileContext'
 import { useAccounts } from '../../hooks/useBalances'
 import { ScopePicker } from '../ui/ScopePicker'
 import { FiltersPanel } from '../ui/FiltersPanel'
+import { PickList } from '../ui/PickList'
+import { TxDrillSheet } from '../ui/TxDrillSheet'
+import { Loading } from '../stats/Card'
+import { OverviewView } from '../stats/OverviewView'
+import { DaysView } from '../stats/DaysView'
+import { BreakdownView } from '../stats/BreakdownView'
+import { TrendsView } from '../stats/TrendsView'
+import { TopView } from '../stats/TopView'
+import { BudgetsView } from '../stats/BudgetsView'
+import { ReportsView } from '../stats/ReportsView'
+import type { Drill, ViewCtx } from '../stats/types'
+import { comparableCutoff, getRange } from '../../utils/period'
 import {
   applyFilters, countActiveFilters, describeFilters, EMPTY_FILTERS, type ReportFilters,
 } from '../../utils/report'
-import { loadAmountColors, loadWidgetPrefs } from '../../utils/uiPrefs'
-import { AnalyticsScreen } from './AnalyticsScreen'
+import {
+  loadAmountColors, loadChartModes, loadPeriods, loadStatsViews, loadWidgetPrefs,
+  saveChartModes, savePeriods, saveStatsViews,
+  PERIOD_OPTIONS, STATS_VIEWS,
+  type ChartModes, type PeriodPref, type StatsViewId,
+} from '../../utils/uiPrefs'
 import type { PeriodId } from '../../types'
 
-const PERIODS: { id: PeriodId; label: string }[] = [
-  { id: 'week', label: 'Неделя' },
-  { id: 'month', label: 'Месяц' },
-  { id: 'quarter', label: 'Квартал' },
-  { id: 'year', label: 'Год' },
-]
-
-type View = 'overview' | 'days' | 'categories' | 'budgets' | 'trends' | 'builder'
-
-const VIEWS: { id: View; label: string }[] = [
-  { id: 'overview', label: 'Обзор' },
-  { id: 'days', label: 'Дни' },
-  { id: 'categories', label: 'Категории' },
-  { id: 'budgets', label: 'Бюджеты' },
-  { id: 'trends', label: 'Тренды' },
-  { id: 'builder', label: 'Конструктор' },
-]
-
-const tooltipStyle = {
-  background: '#1C1C2E', border: '1px solid #1E1E30',
-  borderRadius: 12, color: '#F0F0FF', fontSize: 12,
-}
-
+/**
+ * Аналитика. Разделы и периоды человек выбирает сам (карандаш в шапке):
+ * лишние скрываются, нужные включаются — раньше набор был жёстким, и половина
+ * вкладок была не нужна, а нужного в них не было.
+ *
+ * Экран отвечает за выборку (период, роль, условия) и drill-down; сами разделы
+ * живут в `components/stats/*` и получают готовый `ViewCtx`.
+ */
 export function StatsScreen() {
   const { scope, canSeeAll, profiles } = useProfile()
-  const [period, setPeriod] = useState<PeriodId>('month')
+
+  const [views, setViews] = useState<StatsViewId[]>(loadStatsViews)
+  const [periods, setPeriods] = useState<PeriodPref[]>(loadPeriods)
+  const [modes, setModes] = useState<ChartModes>(loadChartModes)
+  const [editing, setEditing] = useState(false)
+
+  const [view, setView] = useState<StatsViewId>(() => loadStatsViews()[0])
+  const [period, setPeriod] = useState<PeriodId>(() => (loadPeriods().includes('month') ? 'month' : loadPeriods()[0]))
   const [offset, setOffset] = useState(0)
-  const [view, setView] = useState<View>('overview')
+  const [customFrom, setCustomFrom] = useState('')
+  const [customTo, setCustomTo] = useState('')
   const [filters, setFilters] = useState<ReportFilters>(EMPTY_FILTERS)
   const [showFilters, setShowFilters] = useState(false)
+  const [drillInfo, setDrill] = useState<Drill | null>(null)
 
   const accountList = useAccounts(true)
   const maps = useMemo(() => ({ accounts: accountList ?? [], profiles }), [accountList, profiles])
   const activeFilters = countActiveFilters(filters)
+  const colors = useMemo(() => loadAmountColors(), [])
+  const widgets = useMemo(() => loadWidgetPrefs(), [])
 
-  /** Клик по категории в разрезе — быстрый способ сузить выборку до неё одной. */
-  function drillToCategory(categoryId: string) {
-    setFilters(f => ({
-      ...f,
-      categoryIds: f.categoryIds.length === 1 && f.categoryIds[0] === categoryId ? [] : [categoryId],
-    }))
-  }
+  /** Раздел мог быть выключен в карандаше, пока был открыт — тогда берём первый. */
+  const activeView = views.includes(view) ? view : views[0]
 
-  const range = useMemo(() => getRange(period, offset), [period, offset])
+  const range = useMemo(
+    () => getRange(period, offset, customFrom || undefined, customTo || undefined),
+    [period, offset, customFrom, customTo],
+  )
   const prevRange = useMemo(() => getRange(period, offset - 1), [period, offset])
 
   /**
@@ -86,8 +84,7 @@ export function StatsScreen() {
     [prevRange.from.getTime(), prevRange.to.getTime()], [],
   )
   const rawAllTxs = useLiveQuery(() => db.transactions.toArray(), [])
-  const budgets = useLiveQuery(() => db.budgets.toArray(), [])
-  const loading = rawTxs === undefined || rawAllTxs === undefined || budgets === undefined
+  const loading = rawTxs === undefined || rawAllTxs === undefined
 
   /**
    * Порядок обязателен: сначала видимость по роли (`scope`), потом условия
@@ -97,96 +94,126 @@ export function StatsScreen() {
   const txs = useMemo(() => applyFilters(scope(rawTxs ?? []), filters), [rawTxs, scope, filters])
   /**
    * Прошлый период обрезаем по той же точке, до которой дошёл текущий.
-   *
-   * Иначе сравнение врёт в одну сторону: 7 ноября «К прошлому периоду»
-   * сопоставляло неделю с целым октябрём и показывало −81% — цифра выглядит
-   * как «стал тратить втрое меньше», а означает «месяц ещё не кончился».
-   * То же касается процентов по категориям. Когда период завершён
-   * (смотрим прошлый месяц), обрезать нечего — сравниваем целиком.
+   * Иначе 7 ноября «К прошлому периоду» сопоставляло неделю с целым октябрём
+   * и показывало −81%: цифра читается как «стал тратить втрое меньше»,
+   * а означает «месяц ещё не кончился».
    */
   const prevCutoff = useMemo(() => comparableCutoff(range, prevRange), [range, prevRange])
-
   const prevTxs = useMemo(() => {
     const list = applyFilters(scope(rawPrevTxs), filters)
     return prevCutoff ? list.filter(t => t.date <= prevCutoff) : list
   }, [rawPrevTxs, scope, filters, prevCutoff])
   const allTxs = useMemo(() => applyFilters(scope(rawAllTxs ?? []), filters), [rawAllTxs, scope, filters])
 
-  const t = totals(txs)
-  const prevT = totals(prevTxs)
-  const cats = byCategory(txs, prevTxs)
-  const days = byDay(txs, range)
-  const bRows = budgetRows(budgets ?? [], txs, range)
-  const forecast = forecastExpense(txs, range)
-  const subs = useMemo(() => detectSubscriptions(allTxs), [allTxs])
-  const dayBlocks = useMemo(() => byDayBlocks(txs), [txs])
-  const widgets = useMemo(() => loadWidgetPrefs(), [])
-  /** Цвета сумм — те же, что в истории: иначе настройка выглядит нерабочей. */
-  const colors = useMemo(() => loadAmountColors(), [])
+  const setMode = useCallback(<K extends keyof ChartModes>(key: K, value: ChartModes[K]) => {
+    setModes(prev => { const next = { ...prev, [key]: value }; saveChartModes(next); return next })
+  }, [])
 
-  const monthlySeries = useMemo(() => {
-    const out: { label: string; Расходы: number; Доходы: number }[] = []
-    for (let i = 5; i >= 0; i--) {
-      const r = getRange('month', -i)
-      const slice = allTxs.filter(x => x.date >= r.from.toISOString() && x.date <= r.to.toISOString())
-      const m = totals(slice)
-      out.push({
-        label: r.from.toLocaleDateString('ru-RU', { month: 'short' }),
-        Расходы: Math.round(toMajor(m.expense)),
-        Доходы: Math.round(toMajor(m.income)),
-      })
-    }
-    return out
-  }, [allTxs])
+  const ctx: ViewCtx = {
+    txs, prevTxs, allTxs, range, prevCutoff, colors, widgets, modes, setMode, maps,
+    drill: setDrill,
+    hasView: v => views.includes(v),
+    goTo: v => { if (views.includes(v)) setView(v) },
+  }
 
-  const deltaExpense = prevT.expense > 0
-    ? ((t.expense - prevT.expense) / prevT.expense) * 100
-    : null
+  /** Операции под открытым шитом считаются из живого запроса, а не из снимка. */
+  const drillTxs = useMemo(() => {
+    if (!drillInfo) return []
+    return (drillInfo.source === 'all' ? allTxs : txs).filter(drillInfo.match)
+  }, [drillInfo, txs, allTxs])
+
+  function changePeriod(p: PeriodPref) {
+    setPeriod(p)
+    setOffset(0)
+  }
 
   return (
     <div className="flex flex-col gap-4 pb-28">
-      <h1 className="text-text-primary text-2xl font-bold">Аналитика</h1>
+      <div className="flex items-center justify-between gap-3">
+        <h1 className="text-text-primary text-2xl font-bold">Аналитика</h1>
+        <button onClick={() => setEditing(e => !e)}
+          aria-label={editing ? 'Готово' : 'Настроить разделы'}
+          className={`h-9 px-3 rounded-xl text-xs font-semibold flex items-center gap-1.5 flex-none ${
+            editing ? 'bg-accent text-white' : 'bg-bg-card border border-border text-text-secondary'}`}>
+          {editing ? <><Check size={14} /> Готово</> : <><Pencil size={14} /> Разделы</>}
+        </button>
+      </div>
 
+      {editing && (
+        <div className="flex flex-col gap-4 bg-bg-card border border-border rounded-2xl p-4">
+          <div>
+            <p className="text-text-secondary text-xs uppercase tracking-widest mb-1">Разделы аналитики</p>
+            <p className="text-text-secondary/70 text-[11px] mb-2.5">
+              Галочка включает раздел, стрелки задают порядок вкладок.
+            </p>
+            <PickList items={STATS_VIEWS} value={views} reorder
+              onChange={next => { setViews(next); saveStatsViews(next) }} />
+          </div>
+          <div>
+            <p className="text-text-secondary text-xs uppercase tracking-widest mb-1">Периоды</p>
+            <p className="text-text-secondary/70 text-[11px] mb-2.5">
+              Какие кнопки периода показывать. Порядок всегда от короткого к длинному.
+            </p>
+            <PickList items={PERIOD_OPTIONS} value={periods}
+              onChange={next => { setPeriods(next); savePeriods(next) }} />
+          </div>
+          <p className="text-text-secondary/70 text-[11px]">
+            Нижнюю панель и блоки-подсказки настраивают в Настройках. Всё хранится
+            на этом устройстве и в облако не уезжает.
+          </p>
+        </div>
+      )}
+
+      {/* ── Разделы ── */}
       <div className="flex bg-bg-card border border-border rounded-2xl p-1 overflow-x-auto scrollbar-none">
-        {VIEWS.map(v => (
-          <button key={v.id} onClick={() => setView(v.id)}
-            className={`flex-1 min-w-[72px] py-2 rounded-xl text-xs font-semibold transition-all ${
-              view === v.id ? 'bg-accent text-white' : 'text-text-secondary'}`}>
-            {v.label}
+        {views.map(id => (
+          <button key={id} onClick={() => setView(id)}
+            className={`flex-1 min-w-[76px] py-2 px-2 rounded-xl text-xs font-semibold transition-all whitespace-nowrap ${
+              activeView === id ? 'bg-accent text-white' : 'text-text-secondary'}`}>
+            {STATS_VIEWS.find(v => v.id === id)?.label}
           </button>
         ))}
       </div>
 
       <ScopePicker />
 
-      {view === 'builder' && <AnalyticsScreen />}
-
-      {view !== 'builder' && (<>
-      {/* Подразделы периода по центру, а не прижаты к левому краю */}
+      {/* ── Период ── */}
       <div className="flex flex-wrap justify-center gap-2">
-        {PERIODS.map(p => (
-          <button key={p.id} onClick={() => { setPeriod(p.id); setOffset(0) }}
+        {periods.map(p => (
+          <button key={p} onClick={() => changePeriod(p)}
             className={`px-4 py-2 rounded-xl text-sm font-medium transition-all ${
-              period === p.id ? 'bg-accent text-white' : 'bg-bg-card text-text-secondary border border-border'}`}>
-            {p.label}
+              period === p ? 'bg-accent text-white' : 'bg-bg-card text-text-secondary border border-border'}`}>
+            {PERIOD_OPTIONS.find(o => o.id === p)?.label}
           </button>
         ))}
       </div>
 
-      <div className="flex items-center justify-between bg-bg-card border border-border rounded-2xl px-2 py-2">
-        <button onClick={() => setOffset(o => o - 1)} aria-label="Предыдущий период"
-          className="w-9 h-9 rounded-xl bg-bg-card2 flex items-center justify-center text-text-secondary">
-          <ChevronLeft size={18} />
-        </button>
-        <p className="text-text-primary text-sm font-semibold">{range.label}</p>
-        <button onClick={() => setOffset(o => Math.min(0, o + 1))} disabled={offset >= 0}
-          aria-label="Следующий период"
-          className="w-9 h-9 rounded-xl bg-bg-card2 flex items-center justify-center text-text-secondary disabled:opacity-30">
-          <ChevronRight size={18} />
-        </button>
-      </div>
+      {period === 'custom' ? (
+        <div className="flex items-center gap-2 bg-bg-card border border-border rounded-2xl p-2">
+          <input type="date" value={customFrom} onChange={e => setCustomFrom(e.target.value)}
+            aria-label="Дата от"
+            className="flex-1 bg-bg-card2 rounded-xl px-3 py-2 text-text-primary text-xs outline-none" />
+          <span className="text-text-secondary text-xs">—</span>
+          <input type="date" value={customTo} onChange={e => setCustomTo(e.target.value)}
+            aria-label="Дата до"
+            className="flex-1 bg-bg-card2 rounded-xl px-3 py-2 text-text-primary text-xs outline-none" />
+        </div>
+      ) : (
+        <div className="flex items-center justify-between bg-bg-card border border-border rounded-2xl px-2 py-2">
+          <button onClick={() => setOffset(o => o - 1)} aria-label="Предыдущий период"
+            className="w-9 h-9 rounded-xl bg-bg-card2 flex items-center justify-center text-text-secondary">
+            <ChevronLeft size={18} />
+          </button>
+          <p className="text-text-primary text-sm font-semibold">{range.label}</p>
+          <button onClick={() => setOffset(o => Math.min(0, o + 1))} disabled={offset >= 0}
+            aria-label="Следующий период"
+            className="w-9 h-9 rounded-xl bg-bg-card2 flex items-center justify-center text-text-secondary disabled:opacity-30">
+            <ChevronRight size={18} />
+          </button>
+        </div>
+      )}
 
-      {/* ── Условия выборки: действуют на ВСЕ разрезы ── */}
+      {/* ── Условия выборки: действуют на ВСЕ разделы ── */}
       <div className="flex items-center gap-2">
         <button onClick={() => setShowFilters(s => !s)}
           className={`flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-semibold transition-all ${
@@ -196,7 +223,7 @@ export function StatsScreen() {
         </button>
         {activeFilters > 0 && (
           <button onClick={() => setFilters(EMPTY_FILTERS)}
-            className="text-text-muted text-xs underline flex-none">
+            className="text-text-secondary text-xs underline flex-none">
             сбросить
           </button>
         )}
@@ -209,362 +236,53 @@ export function StatsScreen() {
       {/* Видно, почему цифры меньше общих: без подписи сужённая выборка
           выглядит как ошибка в расчётах */}
       {activeFilters > 0 && (
-        <p className="text-text-muted text-[11px] -mt-1">
+        <p className="text-text-secondary text-[11px] -mt-1">
           Выборка сужена: {describeFilters(filters, maps).join(' · ')}. Операций: {txs.length}
         </p>
       )}
 
-      {/* ── ОБЗОР ── */}
-      {view === 'overview' && (
-        loading ? <Loading /> : (
+      {loading ? <Loading /> : (
         <>
-          <div className="grid grid-cols-3 gap-2">
-            {[
-              { label: 'Расходы', value: t.expense, color: colors.expense },
-              { label: 'Доходы', value: t.income, color: colors.income },
-              { label: 'Итого', value: t.net, color: t.net >= 0 ? colors.income : colors.expense },
-            ].map(i => (
-              <div key={i.label} className="bg-bg-card border border-border rounded-2xl p-3">
-                <p className="text-text-muted text-[10px]">{i.label}</p>
-                <p className="text-sm font-bold mt-1" style={{ color: i.color }}>
-                  {formatMoney(i.value, true)}
-                </p>
-              </div>
-            ))}
-          </div>
-
-          {/* «Норма сбережений» убрана: доля дохода сама по себе ни о чём
-              не говорила и в месяц без дохода показывала прочерк. */}
-          {widgets.deltaPrev && (
-            <div className="bg-bg-card border border-border rounded-2xl p-3">
-              <p className="text-text-muted text-[10px]">К прошлому периоду</p>
-              <p className={`text-lg font-bold mt-0.5 ${
-                deltaExpense == null ? 'text-text-muted' : deltaExpense > 0 ? 'text-accent-red' : 'text-accent-green'}`}>
-                {deltaExpense == null ? '—' : `${deltaExpense > 0 ? '+' : ''}${deltaExpense.toFixed(0)}%`}
-              </p>
-              {/* видно, что сравниваются равные отрезки, а не «часть против целого» */}
-              <p className="text-text-muted text-[10px] mt-0.5">
-                {prevCutoff
-                  ? `за те же дни: ${formatMoney(t.expense, true)} против ${formatMoney(prevT.expense, true)}`
-                  : `${formatMoney(t.expense, true)} против ${formatMoney(prevT.expense, true)}`}
-              </p>
-            </div>
+          {activeView === 'overview' && <OverviewView {...ctx} />}
+          {activeView === 'days' && <DaysView {...ctx} />}
+          {activeView === 'categories' && (
+            <BreakdownView {...ctx} groupBy="category" metric="expense" totalLabel="Все расходы" icons />
           )}
-
-          {widgets.structure && (
-          <div className="bg-bg-card border border-border rounded-2xl p-4">
-            <p className="text-text-secondary text-xs uppercase tracking-widest mb-3">Структура расходов</p>
-            <div className="flex gap-2 h-3 rounded-full overflow-hidden bg-bg-card2">
-              <div style={{ width: `${t.expense ? (t.essential / t.expense) * 100 : 0}%` }} className="bg-accent" />
-              <div style={{ width: `${t.expense ? (t.discretionary / t.expense) * 100 : 0}%` }} className="bg-accent-yellow" />
-            </div>
-            <div className="flex justify-between mt-3 text-xs">
-              <span className="text-text-secondary">🔵 Обязательные {formatMoney(t.essential, true)}</span>
-              <span className="text-text-secondary">🟡 Остальное {formatMoney(t.discretionary, true)}</span>
-            </div>
-          </div>
+          {activeView === 'income' && (
+            <BreakdownView {...ctx} groupBy="category" metric="income" totalLabel="Все доходы" icons />
           )}
-
-          {widgets.forecast && forecast != null && (
-            <div className="bg-accent/10 border border-accent/20 rounded-2xl p-4">
-              <p className="text-text-muted text-xs mb-1">Прогноз на конец периода</p>
-              <p className="text-text-primary text-xl font-bold">{formatMoney(forecast)}</p>
-              <p className="text-text-muted text-xs mt-1">
-                Прошло {(periodProgress(range) * 100).toFixed(0)}% периода, потрачено {formatMoney(t.expense, true)}
-              </p>
-            </div>
+          {activeView === 'accounts' && (
+            <BreakdownView {...ctx} groupBy="account" metric="expense" totalLabel="Расходы по счетам" />
           )}
-
-          {days.length > 1 && (
-            <div className="bg-bg-card border border-border rounded-2xl p-4">
-              <p className="text-text-secondary text-xs uppercase tracking-widest mb-4">Расходы по дням</p>
-              <ResponsiveContainer width="100%" height={140}>
-                <BarChart data={days.map(d => ({ name: d.label, value: toMajor(d.expense) }))} barSize={6}>
-                  <XAxis dataKey="name" tick={{ fill: '#8080A8', fontSize: 9 }} axisLine={false} tickLine={false}
-                    interval={Math.max(0, Math.floor(days.length / 8))} />
-                  <Tooltip contentStyle={tooltipStyle}
-                    formatter={(v: unknown) => [formatMoney(Math.round(Number(v) * 100), true), 'Расходы']} />
-                  <Bar dataKey="value" fill="#6C63FF" radius={[3, 3, 0, 0]} />
-                </BarChart>
-              </ResponsiveContainer>
-            </div>
+          {activeView === 'weekdays' && (
+            <BreakdownView {...ctx} groupBy="weekday" metric="expense" totalLabel="Расходы по дням недели" forceBars />
           )}
+          {activeView === 'trends' && <TrendsView {...ctx} />}
+          {activeView === 'top' && <TopView {...ctx} />}
+          {activeView === 'budgets' && <BudgetsView {...ctx} />}
+          {activeView === 'builder' && <ReportsView {...ctx} />}
         </>
-        )
       )}
 
-      {/* ── ДНИ ── */}
-      {view === 'days' && (
-        loading ? <Loading /> : dayBlocks.length === 0 ? <Empty /> : (
-          <div className="flex flex-col gap-2.5">
-            {dayBlocks.map(d => (
-              <div key={d.date}
-                className={`rounded-2xl border p-4 ${
-                  d.heavy ? 'bg-accent-red/5 border-accent-red/25' : 'bg-bg-card border-border'}`}>
-                <div className="flex items-baseline justify-between mb-2">
-                  <div className="flex items-baseline gap-2 min-w-0">
-                    {/* ключ дня, а не ISO: `formatDate('2026-11-07')` разбирает
-                        строку как UTC-полночь и в минусовом поясе печатает «Вчера» */}
-                    <p className="text-text-primary text-sm font-semibold">{formatDayKey(d.date)}</p>
-                    <span className="text-text-muted text-[11px] flex-none">
-                      {d.count} {plural(d.count, 'операция', 'операции', 'операций')}
-                    </span>
-                  </div>
-                  <div className="text-right flex-none">
-                    {d.expense > 0 && (
-                      <p className="text-sm font-bold" style={{ color: colors.expense }}>
-                        −{formatMoney(d.expense, true)}
-                      </p>
-                    )}
-                    {d.income > 0 && (
-                      <p className="text-xs font-semibold" style={{ color: colors.income }}>
-                        +{formatMoney(d.income, true)}
-                      </p>
-                    )}
-                  </div>
-                </div>
-
-                {/* полоска — вес дня относительно самого дорогого в периоде */}
-                <div className="h-1.5 rounded-full bg-bg-card2 overflow-hidden mb-3">
-                  <div className={`h-full rounded-full ${d.heavy ? 'bg-accent-red' : 'bg-accent'}`}
-                    style={{ width: `${Math.max(2, d.weight * 100)}%` }} />
-                </div>
-
-                <div className="flex flex-wrap gap-1.5">
-                  {d.categories.map(c => (
-                    <button key={c.categoryId} onClick={() => drillToCategory(c.categoryId)}
-                      className="inline-flex items-center gap-1 bg-bg-card2 rounded-lg px-2 py-1 text-[11px] text-text-secondary active:scale-95 transition-transform">
-                      <CategoryIcon id={c.categoryId} size={14} />
-                      <span className="truncate max-w-[9rem]">{categoryName(c.categoryId)}</span>
-                      <span className="text-text-primary font-semibold">{formatMoney(c.amount, true)}</span>
-                      {c.count > 1 && <span className="text-text-muted">×{c.count}</span>}
-                    </button>
-                  ))}
-                </div>
-
-                {d.heavy && (
-                  <p className="text-accent-red text-[11px] mt-2.5">Дороже обычного дня в этом периоде</p>
-                )}
-              </div>
-            ))}
-          </div>
-        )
+      {drillInfo && (
+        <TxDrillSheet
+          title={drillInfo.title}
+          subtitle={drillInfo.subtitle}
+          txs={drillTxs}
+          colors={colors}
+          accounts={maps.accounts}
+          onClose={() => setDrill(null)}
+          action={drillInfo.categoryId
+            ? {
+              label: 'Оставить в выборке только эту категорию',
+              run: () => {
+                setFilters(f => ({ ...f, categoryIds: [drillInfo.categoryId!] }))
+                setDrill(null)
+              },
+            }
+            : undefined}
+        />
       )}
-
-      {/* ── КАТЕГОРИИ ── */}
-      {view === 'categories' && (
-        loading ? <Loading /> : cats.length === 0 ? (
-          <Empty />
-        ) : (
-          <>
-            <div className="bg-bg-card border border-border rounded-2xl p-4">
-              <div className="flex gap-4 items-center">
-                <ResponsiveContainer width={130} height={130}>
-                  <PieChart>
-                    <Pie data={cats.slice(0, 7)} dataKey="amount" innerRadius={40} outerRadius={62}
-                      paddingAngle={3} startAngle={90} endAngle={-270}>
-                      {cats.slice(0, 7).map(c => (
-                        <Cell key={c.categoryId} fill={categoryColor(c.categoryId)} />
-                      ))}
-                    </Pie>
-                    <Tooltip contentStyle={tooltipStyle}
-                      formatter={(v: unknown, _n, p: { payload?: { categoryId?: string } }) =>
-                        [formatMoney(Number(v), true), categoryName(p?.payload?.categoryId ?? '')]} />
-                  </PieChart>
-                </ResponsiveContainer>
-                <div className="flex flex-col gap-1.5 flex-1">
-                  {cats.slice(0, 7).map(c => (
-                    <div key={c.categoryId} className="flex items-center gap-2">
-                      <div className="w-2 h-2 rounded-full flex-none" style={{ background: categoryColor(c.categoryId) }} />
-                      <span className="text-xs text-text-secondary flex-1 truncate">{categoryName(c.categoryId)}</span>
-                      <span className="text-xs text-text-primary">{c.share.toFixed(0)}%</span>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            </div>
-
-            <div className="bg-bg-card border border-border rounded-2xl p-4">
-              <p className="text-text-secondary text-xs uppercase tracking-widest mb-4">
-                Детализация и динамика
-              </p>
-              <p className="text-text-muted text-[11px] -mt-2 mb-3">
-                Нажмите на категорию, чтобы оставить в выборке только её.
-              </p>
-              <div className="flex flex-col gap-3.5">
-                {cats.map(c => (
-                  <button key={c.categoryId} onClick={() => drillToCategory(c.categoryId)}
-                    className="w-full text-left">
-                    <div className="flex items-center justify-between mb-1">
-                      <p className="text-text-primary text-sm flex items-center gap-1.5">
-                        <CategoryIcon id={c.categoryId} size={16} />
-                        {categoryName(c.categoryId)}
-                        <span className="text-text-muted text-xs">×{c.count}</span>
-                      </p>
-                      <div className="flex items-center gap-2">
-                        {c.delta != null && Math.abs(c.delta) >= 5 && (
-                          <span className={`text-[10px] font-semibold ${c.delta > 0 ? 'text-accent-red' : 'text-accent-green'}`}>
-                            {c.delta > 0 ? '+' : ''}{c.delta.toFixed(0)}%
-                          </span>
-                        )}
-                        <span className="text-text-secondary text-xs">{formatMoney(c.amount, true)}</span>
-                      </div>
-                    </div>
-                    <div className="h-1.5 rounded-full bg-bg-card2 overflow-hidden">
-                      <div className="h-full rounded-full transition-all"
-                        style={{ width: `${c.share}%`, background: categoryColor(c.categoryId) }} />
-                    </div>
-                  </button>
-                ))}
-              </div>
-            </div>
-          </>
-        )
-      )}
-
-      {/* ── БЮДЖЕТЫ ── */}
-      {view === 'budgets' && (
-        loading ? <Loading /> : bRows.length === 0 ? (
-          <div className="text-center py-14">
-            <p className="text-4xl mb-2">🎯</p>
-            <p className="text-text-secondary text-sm">Бюджеты не заданы</p>
-            <p className="text-text-muted text-xs mt-1">Настройки → Бюджеты по категориям</p>
-          </div>
-        ) : (
-          <div className="flex flex-col gap-3">
-            {bRows.map(r => (
-              <div key={r.budget.id} className="bg-bg-card border border-border rounded-2xl p-4">
-                <div className="flex items-center justify-between mb-2">
-                  <p className="text-text-primary text-sm font-medium flex items-center gap-1.5">
-                    <CategoryIcon id={r.budget.categoryId} size={16} />
-                    {categoryName(r.budget.categoryId)}
-                  </p>
-                  <p className={`text-xs font-semibold ${
-                    r.status === 'over' ? 'text-accent-red' : r.status === 'warn' ? 'text-accent-yellow' : 'text-accent-green'}`}>
-                    {r.pct.toFixed(0)}%
-                  </p>
-                </div>
-                <div className="relative h-2 rounded-full bg-bg-card2 overflow-hidden">
-                  <div className={`h-full rounded-full ${
-                    r.status === 'over' ? 'bg-accent-red' : r.status === 'warn' ? 'bg-accent-yellow' : 'bg-accent-green'}`}
-                    style={{ width: `${Math.min(100, r.pct)}%` }} />
-                  {/* метка «где мы должны быть по календарю» */}
-                  <div className="absolute top-0 bottom-0 w-0.5 bg-text-primary/50"
-                    style={{ left: `${r.pace * 100}%` }} />
-                </div>
-                <div className="flex justify-between mt-2 text-xs">
-                  <span className="text-text-secondary">{formatMoney(r.spent, true)} из {formatMoney(r.budget.amount, true)}</span>
-                  <span className={r.budget.amount - r.spent >= 0 ? 'text-text-muted' : 'text-accent-red'}>
-                    {r.budget.amount - r.spent >= 0
-                      ? `осталось ${formatMoney(r.budget.amount - r.spent, true)}`
-                      : `перерасход ${formatMoney(r.spent - r.budget.amount, true)}`}
-                  </span>
-                </div>
-                {r.status === 'warn' && (
-                  <p className="text-accent-yellow text-[11px] mt-2">
-                    Темп выше календарного: прошло {(r.pace * 100).toFixed(0)}% периода
-                  </p>
-                )}
-              </div>
-            ))}
-          </div>
-        )
-      )}
-
-      {/* ── ТРЕНДЫ ── */}
-      {view === 'trends' && (
-        loading ? <Loading /> : (
-        <>
-          <div className="bg-bg-card border border-border rounded-2xl p-4">
-            <p className="text-text-secondary text-xs uppercase tracking-widest mb-4">
-              Доходы и расходы, 6 месяцев
-            </p>
-            <ResponsiveContainer width="100%" height={190}>
-              <LineChart data={monthlySeries} margin={{ left: -18, right: 6 }}>
-                <CartesianGrid stroke="#1E1E30" vertical={false} />
-                <XAxis dataKey="label" tick={{ fill: '#8080A8', fontSize: 10 }} axisLine={false} tickLine={false} />
-                <YAxis tick={{ fill: '#8080A8', fontSize: 9 }} axisLine={false} tickLine={false}
-                  tickFormatter={(v: number) => (v >= 1000 ? `${Math.round(v / 1000)}к` : String(v))} />
-                <Tooltip contentStyle={tooltipStyle}
-                  formatter={(v: unknown, name: unknown) => [formatMoney(Math.round(Number(v) * 100), true), String(name)]} />
-                <Legend wrapperStyle={{ fontSize: 11, color: '#8080A8' }} />
-                {/* те же цвета, что у сумм: линии и цифры не должны расходиться */}
-                <Line type="monotone" dataKey="Расходы" stroke={colors.expense} strokeWidth={2} dot={{ r: 2 }} />
-                <Line type="monotone" dataKey="Доходы" stroke={colors.income} strokeWidth={2} dot={{ r: 2 }} />
-              </LineChart>
-            </ResponsiveContainer>
-          </div>
-
-          {widgets.cumulative && (
-          <div className="bg-bg-card border border-border rounded-2xl p-4">
-            <p className="text-text-secondary text-xs uppercase tracking-widest mb-4">
-              Накопительный расход за период
-            </p>
-            <ResponsiveContainer width="100%" height={150}>
-              <LineChart data={days.map(d => ({ name: d.label, value: toMajor(d.cumulative) }))} margin={{ left: -18, right: 6 }}>
-                <CartesianGrid stroke="#1E1E30" vertical={false} />
-                <XAxis dataKey="name" tick={{ fill: '#8080A8', fontSize: 9 }} axisLine={false} tickLine={false}
-                  interval={Math.max(0, Math.floor(days.length / 8))} />
-                <YAxis tick={{ fill: '#8080A8', fontSize: 9 }} axisLine={false} tickLine={false}
-                  tickFormatter={(v: number) => (v >= 1000 ? `${Math.round(v / 1000)}к` : String(v))} />
-                <Tooltip contentStyle={tooltipStyle}
-                  formatter={(v: unknown) => [formatMoney(Math.round(Number(v) * 100), true), 'Накопленно']} />
-                <Line type="monotone" dataKey="value" stroke="#6C63FF" strokeWidth={2} dot={false} />
-              </LineChart>
-            </ResponsiveContainer>
-          </div>
-          )}
-
-          {widgets.subscriptions && subs.length > 0 && (
-            <div className="bg-bg-card border border-border rounded-2xl p-4">
-              <div className="flex items-center gap-2 mb-3">
-                <Repeat size={14} className="text-accent" />
-                <p className="text-text-secondary text-xs uppercase tracking-widest">Похоже на подписки</p>
-              </div>
-              <div className="flex flex-col gap-2.5">
-                {subs.map(s => (
-                  /* ключ по названию + сумме: detectSubscriptions группирует ещё и по
-                     сумме, и две группы с одним названием давали одинаковый ключ */
-                  <div key={`${s.title}|${s.amount}`} className="flex items-center gap-3">
-                    <CategoryIcon id={s.categoryId} size={22} />
-                    <div className="flex-1 min-w-0">
-                      <p className="text-text-primary text-sm truncate">{s.title}</p>
-                      <p className="text-text-muted text-[11px]">
-                        {s.count} списаний, последнее {formatDateShort(s.lastDate)}
-                      </p>
-                    </div>
-                    <p className="text-text-secondary text-sm font-semibold">{formatMoney(s.amount, true)}</p>
-                  </div>
-                ))}
-              </div>
-              <p className="text-text-muted text-[11px] mt-3">
-                Итого в месяц: {formatMoney(subs.reduce((s, x) => s + x.amount, 0))}
-              </p>
-            </div>
-          )}
-        </>
-        )
-      )}
-
-      {/* только там, где у разреза нет своего пустого состояния: «Категории»
-          рисуют его сами, и раньше получалось два блока подряд */}
-      {!loading && txs.length === 0 && (view === 'overview' || view === 'trends') && <Empty />}
-      </>)}
-    </div>
-  )
-}
-
-/** Читаем из базы. Отдельно от «Нет данных»: иначе на первом кадре каждый
- *  разрез утверждал, что за период ничего нет. */
-function Loading() {
-  return <p className="text-text-muted text-xs text-center py-16">Загружаем…</p>
-}
-
-function Empty() {
-  return (
-    <div className="text-center py-16">
-      <p className="text-4xl mb-2">📊</p>
-      <p className="text-text-secondary">Нет данных за период</p>
     </div>
   )
 }

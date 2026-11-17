@@ -54,6 +54,11 @@ eq('старые хранилища удалены', db.tables.map(t => t.name).
 eq('таблица categories создана', db.tables.map(t => t.name).includes('categories'), true)
 eq('categories после миграции пуста', await db.categories.count(), 0)
 
+// v5→v6: корзина удалённых операций создана и пуста, история при этом цела
+eq('таблица trash создана', db.tables.map(t => t.name).includes('trash'), true)
+eq('trash после миграции пуста', await db.trash.count(), 0)
+eq('v6 не тронула операции', await db.transactions.count(), 4)
+
 let failed = 0
 for (const [n, ok, d] of checks) { console.log(`${ok ? '  ok  ' : ' FAIL '} ${n}${ok ? '' : ' — ' + d}`); if (!ok) failed++ }
 console.log(`\n${checks.length - failed}/${checks.length} проверок миграции пройдено`)

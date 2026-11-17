@@ -129,6 +129,23 @@ export interface Transaction {
   deletedAt?: string | null
 }
 
+/**
+ * Удалённая операция в корзине. Хранится ТОЛЬКО локально и в очередь синка
+ * не попадает: на сервере удаление и так лежит tombstone'ом со всеми полями,
+ * и `pull` раскладывает такие строки сюда же — корзина сама сходится между
+ * устройствами без отдельной таблицы в Supabase.
+ *
+ * Проводки не храним: они однозначно собираются из самой операции
+ * (`buildPostings`), а баланс всё равно считается из них заново.
+ */
+export interface TrashedTransaction {
+  /** id операции — он же ключ, чтобы повторное удаление не плодило дубль */
+  id: string
+  tx: Transaction
+  /** когда удалили; по этой дате корзина сортируется и чистится */
+  deletedAt: string
+}
+
 /** Одна «нога» операции. Баланс счёта = openingBalance + Σ amount всех его postings. */
 export interface Posting {
   id: string
@@ -224,7 +241,7 @@ export interface MetaRow {
 }
 
 export type TabId = 'home' | 'transactions' | 'stats' | 'accounts' | 'goals' | 'settings'
-export type PeriodId = 'week' | 'month' | 'quarter' | 'year' | 'custom'
+export type PeriodId = 'day' | 'week' | 'month' | 'quarter' | 'year' | 'custom'
 
 export interface Range {
   from: Date

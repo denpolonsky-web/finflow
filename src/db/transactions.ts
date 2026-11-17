@@ -130,15 +130,90 @@ export async function updateTransaction(id: string, input: TxInput): Promise<voi
   await enqueue('transaction', id, 'upsert', tx)
 }
 
-/** Мягкое удаление: проводки снимаются (баланс возвращается), на сервер уходит tombstone. */
+/**
+ * Мягкое удаление: проводки снимаются (баланс возвращается), на сервер уходит
+ * tombstone, а сама операция кладётся в локальную корзину — оттуда её можно
+ * вернуть. Раньше удаление было необратимым: промах пальцем по кнопке под
+ * «Сохранить» стоил операции без следа.
+ */
 export async function deleteTransaction(id: string): Promise<void> {
+  const existing = await db.transactions.get(id)
   const legs = await db.postings.where('transactionId').equals(id).toArray()
-  await db.transaction('rw', [db.transactions, db.postings, db.syncQueue], async () => {
+  const now = new Date().toISOString()
+  await db.transaction('rw', [db.transactions, db.postings, db.trash], async () => {
     await db.postings.bulkDelete(legs.map(l => l.id))
     await db.transactions.delete(id)
+    if (existing) await db.trash.put({ id, tx: { ...existing, deletedAt: now }, deletedAt: now })
   })
   for (const l of legs) await enqueue('posting', l.id, 'delete', null)
   await enqueue('transaction', id, 'delete', null)
+}
+
+/** Сколько дней операция лежит в корзине, прежде чем уйти из неё насовсем. */
+export const TRASH_KEEP_DAYS = 90
+
+/**
+ * Возврат операции из корзины.
+ *
+ * Проводки собираются ЗАНОВО из самой операции, с новыми id: старые ушли
+ * на сервер tombstone'ами, и оживлять их незачем — баланс всё равно считается
+ * суммой живых проводок. Операция возвращается под своим прежним id, поэтому
+ * upsert в очереди схлопывает неотправленное удаление (если оно ещё не уехало),
+ * а на сервере снимает `deleted_at` с уже удалённой строки.
+ */
+export async function restoreTransaction(id: string): Promise<Transaction> {
+  const item = await db.trash.get(id)
+  if (!item) throw new LedgerError('Операции нет в корзине')
+
+  // уже вернулась — с другого устройства или повторным нажатием
+  const alive = await db.transactions.get(id)
+  if (alive) { await db.trash.delete(id); return alive }
+
+  const src = item.tx
+  if (!(await db.accounts.get(src.accountId))) {
+    throw new LedgerError('Счёт этой операции удалён — вернуть её некуда')
+  }
+  if (src.type === 'transfer' && !(src.toAccountId && await db.accounts.get(src.toAccountId))) {
+    throw new LedgerError('Счёт зачисления удалён — перевод вернуть некуда')
+  }
+
+  const now = new Date().toISOString()
+  const tx: Transaction = { ...src, updatedAt: now, deletedAt: null }
+  const input: TxInput = {
+    type: tx.type, amount: tx.amount, categoryId: tx.categoryId,
+    accountId: tx.accountId, toAccountId: tx.toAccountId ?? null,
+  }
+  validate(input)
+  const legs = buildPostings(id, input, tx.date)
+
+  await db.transaction('rw', [db.transactions, db.postings, db.trash], async () => {
+    await db.transactions.put(tx)
+    await db.postings.bulkAdd(legs)
+    await db.trash.delete(id)
+  })
+
+  await enqueue('transaction', id, 'upsert', tx)
+  for (const l of legs) await enqueue('posting', l.id, 'upsert', l)
+  return tx
+}
+
+/** Убрать одну операцию из корзины насовсем. На сервере она и так удалена. */
+export async function dropFromTrash(id: string): Promise<void> {
+  await db.trash.delete(id)
+}
+
+/** Очистить корзину целиком. */
+export async function emptyTrash(): Promise<void> {
+  await db.trash.clear()
+}
+
+/**
+ * Выбросить из корзины то, что лежит дольше `TRASH_KEEP_DAYS`. `now` — параметр,
+ * чтобы тест не зависел от текущего времени.
+ */
+export async function purgeOldTrash(now = Date.now()): Promise<number> {
+  const border = new Date(now - TRASH_KEEP_DAYS * 86_400_000).toISOString()
+  return db.trash.where('deletedAt').below(border).delete()
 }
 
 /**

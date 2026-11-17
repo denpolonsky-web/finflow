@@ -17,7 +17,13 @@ export const DEFAULT_CATEGORIES: Category[] = [
   // расходы
   { id: 'groceries',     name: 'Продукты',     icon: '🛒', color: '#4CAF50', type: 'expense', essential: true },
   { id: 'food',          name: 'Кафе и еда',   icon: '🍔', color: '#FF8C42', type: 'expense' },
+  // Сети фастфуда — отдельными категориями с логотипом, как маркетплейсы ниже:
+  // по ним идёт заметная доля трат на еду, и в «Кафе» они сливались в одно.
+  { id: 'vkusno',        name: 'Вкусно — и точка', icon: '/shops/vkusno.png',     color: '#F27A1A', type: 'expense' },
+  { id: 'rostics',       name: 'Rostic’s',     icon: '/shops/rostics.png',    color: '#E0373A', type: 'expense' },
+  { id: 'burger_king',   name: 'Бургер Кинг',  icon: '/shops/burgerking.png', color: '#D62300', type: 'expense' },
   { id: 'transport',     name: 'Транспорт',    icon: '🚇', color: '#2196F3', type: 'expense', essential: true },
+  { id: 'yandex_go',     name: 'Яндекс Go',    icon: '/shops/yandexgo.png',   color: '#FFDD2D', type: 'expense' },
   { id: 'housing',       name: 'ЖКХ и аренда', icon: '🏠', color: '#795548', type: 'expense', essential: true },
   { id: 'telecom',       name: 'Связь',        icon: '📱', color: '#00BCD4', type: 'expense', essential: true },
   { id: 'health',        name: 'Здоровье',     icon: '💊', color: '#E91E63', type: 'expense', essential: true },
@@ -29,6 +35,7 @@ export const DEFAULT_CATEGORIES: Category[] = [
   // а не эмодзи; как это устроено, см. `isImageIcon` ниже.
   { id: 'ozon',          name: 'Озон',         icon: '/shops/ozon.png', color: '#005BFF', type: 'expense' },
   { id: 'wb',            name: 'Wildberries',  icon: '/shops/wb.png',   color: '#CB11AB', type: 'expense' },
+  { id: 'dns',           name: 'DNS',          icon: '/shops/dns.png',  color: '#F68B1F', type: 'expense' },
   { id: 'sport',         name: 'Спорт',        icon: '💪', color: '#8BC34A', type: 'expense' },
   { id: 'travel',        name: 'Путешествия',  icon: '✈️', color: '#03A9F4', type: 'expense' },
   { id: 'education',     name: 'Образование',  icon: '🎓', color: '#673AB7', type: 'expense' },

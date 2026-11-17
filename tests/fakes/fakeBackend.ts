@@ -32,6 +32,16 @@ export class FakeBackend implements SyncBackend {
   /** сколько раз сервер вообще трогали — чтобы ловить лишние обращения */
   writes = 0
   reads = 0
+  /** из них пакетных запросов */
+  batchWrites = 0
+
+  /**
+   * «Ядовитая» строка: сервер отвергает её по содержимому всегда. Пакет с такой
+   * строкой отвергается ЦЕЛИКОМ — как в Postgres, где вставка атомарна.
+   */
+  poison: ((payload: Record<string, unknown>) => boolean) | null = null
+
+  private static readonly REJECT: PushOutcome = { ok: false, message: 'invalid input syntax for type bigint' }
 
   /** Следующие `times` записей закончатся этим сбоем. */
   failWrites(mode: FailMode, times = 1) {
@@ -65,12 +75,43 @@ export class FakeBackend implements SyncBackend {
     this.writes++
     const res = this.outcome(this.writeFailures.shift())
     if (res !== 'ok') return res
+    if (this.poison?.(payload)) return FakeBackend.REJECT
 
+    this.store(table, payload, onConflict)
+    return { ok: true }
+  }
+
+  private store(table: string, payload: Record<string, unknown>, onConflict: 'id' | 'user_id') {
     const t = this.tables.get(table) ?? new Map()
     // app_settings живут одной строкой на пользователя — ключа id у них нет
     const key = onConflict === 'user_id' ? 'singleton' : String(payload.id ?? '')
     t.set(key, { ...t.get(key), ...payload, id: payload.id ?? key })
     this.tables.set(table, t)
+  }
+
+  /** Пакетная вставка: либо все строки, либо ни одной. */
+  async upsertMany(table: string, payloads: Record<string, unknown>[]): Promise<PushOutcome | null> {
+    this.writes++
+    this.batchWrites++
+    const res = this.outcome(this.writeFailures.shift())
+    if (res !== 'ok') return res
+    if (this.poison && payloads.some(p => this.poison!(p))) return FakeBackend.REJECT
+
+    for (const p of payloads) this.store(table, p, 'id')
+    return { ok: true }
+  }
+
+  async softDeleteMany(table: string, ids: string[], now: string): Promise<PushOutcome | null> {
+    this.writes++
+    this.batchWrites++
+    const res = this.outcome(this.writeFailures.shift())
+    if (res !== 'ok') return res
+
+    const t = this.tables.get(table)
+    for (const id of ids) {
+      const existing = t?.get(id)
+      if (t && existing) t.set(id, { ...existing, deleted_at: now, updated_at: now })
+    }
     return { ok: true }
   }
 

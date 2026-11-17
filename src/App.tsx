@@ -19,6 +19,7 @@ import { AuthScreen } from './components/screens/AuthScreen'
 import { ProfileGate } from './components/screens/ProfileGate'
 import { isFirstLaunch, getSettings } from './db'
 import { ensureDefaultProfile } from './db/profiles'
+import { purgeOldTrash } from './db/transactions'
 import { hasSupabase, withTimeout } from './db/supabase'
 import { getSession, onAuthChange, onUserResolved } from './db/auth'
 import { bootstrapSync } from './db/sync'
@@ -74,14 +75,20 @@ function SyncBanner({ status, pending, onRetry }: {
 }
 
 function Toast() {
-  const { toast } = useApp()
+  const { toast, hideToast } = useApp()
   if (!toast) return null
   return (
     /* выше плашки синхронизации: обе висят над навигацией и иначе наложились бы */
     <div className="fixed left-0 right-0 z-[60] flex justify-center px-4 pointer-events-none"
       style={{ bottom: 'calc(8.5rem + env(safe-area-inset-bottom))' }}>
-      <div className="bg-bg-card2 border border-border text-text-primary text-sm px-4 py-2.5 rounded-xl shadow-lg">
-        {toast}
+      <div className="pointer-events-auto bg-bg-card2 border border-white/10 text-text-primary text-sm pl-4 pr-2 py-2 rounded-xl shadow-lg flex items-center gap-3">
+        <span className="py-0.5 pr-2">{toast.msg}</span>
+        {toast.action && (
+          <button onClick={() => { toast.action?.run(); hideToast() }}
+            className="flex-none bg-accent text-white text-xs font-semibold px-3 py-1.5 rounded-lg">
+            {toast.action.label}
+          </button>
+        )}
       </div>
     </div>
   )
@@ -128,6 +135,9 @@ function AppInner() {
       if (!(await isFirstLaunch())) {
         await ensureDefaultProfile((await getSettings())?.userName)
       }
+
+      // корзина не копится вечно; запуск от этого не зависит — ошибку только пишем
+      void purgeOldTrash().catch(e => console.warn('[trash]', e))
 
       setPhase((await isFirstLaunch()) ? 'onboarding' : 'ready')
     } catch (e) {
@@ -187,7 +197,9 @@ function AppInner() {
 
   return (
     <div className="min-h-dvh bg-bg-primary text-text-primary">
-      <SyncBanner status={sync.status} pending={sync.pending} onRetry={sync.syncNow} />
+      {/* `banner`, а не `status`: фоновый круг и только что заведённая операция
+          плашку не зажигают — подробный статус остаётся в настройках */}
+      <SyncBanner status={sync.banner} pending={sync.pending} onRetry={sync.syncNow} />
       <div className="max-w-lg mx-auto px-4" style={{ paddingTop: 'calc(1rem + env(safe-area-inset-top))' }}>
         {tab === 'home' && <HomeScreen />}
         {tab === 'transactions' && <TransactionsScreen />}

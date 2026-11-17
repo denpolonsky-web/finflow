@@ -39,6 +39,22 @@ export const CHARTS: { id: ChartKind; label: string }[] = [
   { id: 'table', label: 'Таблица' },
 ]
 
+/**
+ * Как разрез читается во фразе «Расходы …». Отдельно от `label`, потому что
+ * в заголовке нужен другой падеж: «Расходы категория» вместо «Расходы
+ * по категориям» выглядит как ошибка.
+ */
+export const GROUP_PHRASE: Record<GroupBy, string> = {
+  category: 'по категориям',
+  account: 'по счетам',
+  profile: 'по профилям',
+  type: 'по типу операции',
+  day: 'по дням',
+  week: 'по неделям',
+  month: 'по месяцам',
+  weekday: 'по дням недели',
+}
+
 /** Разрезы, у которых есть естественный порядок по времени — их не сортируем по величине. */
 const TIME_GROUPS: GroupBy[] = ['day', 'week', 'month', 'weekday']
 
@@ -161,7 +177,7 @@ export interface LookupMaps {
  * в отчёт за прошлый месяц. Неделя и день недели и так считались по местному
  * времени — иначе разрезы противоречили бы друг другу.
  */
-function keyOf(t: Transaction, by: GroupBy): string {
+export function keyOf(t: Transaction, by: GroupBy): string {
   const d = new Date(t.date)
   switch (by) {
     case 'category': return t.categoryId

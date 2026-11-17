@@ -2,7 +2,8 @@ import { db, getMeta, setMeta, DEFAULT_SETTINGS } from './index'
 import { supabase, hasSupabase, withTimeout } from './supabase'
 import { isNetworkFailure } from './cloudConfig'
 import { pendingIds, enqueue } from './queue'
-import type { SyncEntity, SyncQueueItem } from '../types'
+import { TRASH_KEEP_DAYS } from './transactions'
+import type { SyncEntity, SyncQueueItem, Transaction, TrashedTransaction } from '../types'
 
 const TABLE: Record<SyncEntity, string> = {
   account: 'accounts',
@@ -37,6 +38,18 @@ const MAX_RETRIES = 5
  */
 const NET_FAILURE_LIMIT = 3
 
+/**
+ * Сколько записей уходит одним запросом.
+ *
+ * Раньше каждая запись очереди была отдельным запросом: «Отправить всё заново»
+ * на двух тысячах операций — это четыре тысячи запросов подряд (операция +
+ * проводка), и плашка «Синхронизация…» висела минутами. Пачкой те же данные
+ * уезжают за два десятка запросов.
+ */
+export const PUSH_BATCH = 200
+/** Удаления идут списком id в адресе запроса, поэтому пачка меньше. */
+export const DELETE_BATCH = 100
+
 // ─────────────────────────────────────────────────────────────────────────────
 // camelCase ↔ snake_case
 // ─────────────────────────────────────────────────────────────────────────────
@@ -66,6 +79,8 @@ export interface SyncReport {
   failed: number
   dead: number
   error?: string
+  /** круг не запускался: другой ещё не закончился */
+  skipped?: boolean
 }
 
 /** Результат одной попытки отправки. Успех и ошибка различимы по полю `ok`. */
@@ -85,12 +100,20 @@ export type FetchPage = { rows: Record<string, unknown>[] } | { error: string }
  *
  * Реализация ОБЯЗАНА возвращать `null` вместо броска исключения, когда ответа
  * не было: различение «не ответил» и «отказал» — основа защиты от потери данных.
+ *
+ * Пакетные методы атомарны: либо пачка принята целиком, либо отвергнута
+ * целиком. На этом построен разбор отказа — см. `push`.
  */
 export interface SyncBackend {
   upsert(table: string, payload: Record<string, unknown>, onConflict: 'id' | 'user_id'): Promise<PushOutcome | null>
   softDelete(table: string, id: string, now: string): Promise<PushOutcome | null>
+  upsertMany(table: string, payloads: Record<string, unknown>[]): Promise<PushOutcome | null>
+  softDeleteMany(table: string, ids: string[], now: string): Promise<PushOutcome | null>
   fetchSince(table: string, since: string, from: number, limit: number): Promise<FetchPage | null>
 }
+
+const outcome = ({ error }: { error: { message: string } | null }): PushOutcome =>
+  (error ? { ok: false, message: error.message } : { ok: true })
 
 /** Боевой бэкенд поверх supabase-js. Таймауты живут здесь же. */
 export function supabaseBackend(): SyncBackend {
@@ -98,15 +121,24 @@ export function supabaseBackend(): SyncBackend {
     // Promise.resolve вокруг запроса обязателен: конструктор запроса supabase-js —
     // это thenable, а не настоящий Promise, и withTimeout его не принимает
     upsert: (table, payload, onConflict) => withTimeout(
-      Promise.resolve(supabase!.from(table).upsert(payload, { onConflict }))
-        .then(({ error }) => (error ? { ok: false as const, message: error.message } : { ok: true as const })),
+      Promise.resolve(supabase!.from(table).upsert(payload, { onConflict })).then(outcome),
       12_000, `push ${table}`,
     ),
 
     softDelete: (table, id, now) => withTimeout(
-      Promise.resolve(supabase!.from(table).update({ deleted_at: now, updated_at: now }).eq('id', id))
-        .then(({ error }) => (error ? { ok: false as const, message: error.message } : { ok: true as const })),
+      Promise.resolve(supabase!.from(table).update({ deleted_at: now, updated_at: now }).eq('id', id)).then(outcome),
       12_000, `delete ${table}`,
+    ),
+
+    // пачке даём больше времени: в запросе до PUSH_BATCH строк
+    upsertMany: (table, payloads) => withTimeout(
+      Promise.resolve(supabase!.from(table).upsert(payloads, { onConflict: 'id' })).then(outcome),
+      25_000, `push ${table} ×${payloads.length}`,
+    ),
+
+    softDeleteMany: (table, ids, now) => withTimeout(
+      Promise.resolve(supabase!.from(table).update({ deleted_at: now, updated_at: now }).in('id', ids)).then(outcome),
+      25_000, `delete ${table} ×${ids.length}`,
     ),
 
     fetchSince: (table, since, from, limit) => withTimeout(
@@ -118,6 +150,14 @@ export function supabaseBackend(): SyncBackend {
       20_000, `pull ${table}`,
     ),
   }
+}
+
+/** Тело upsert'а: снимок сущности в snake_case со свежим `updated_at`. */
+function upsertPayload(item: SyncQueueItem, now: string): Record<string, unknown> {
+  const payload = keysToSnake({ ...(item.payload as Record<string, unknown>), updatedAt: now })
+  // settings живут по одной строке на пользователя — ключ не id, а user_id (ставит сервер)
+  if (item.entityType === 'settings') delete payload.id
+  return payload
 }
 
 /**
@@ -132,12 +172,7 @@ async function pushItem(backend: SyncBackend, item: SyncQueueItem): Promise<Push
   if (item.operation === 'delete') {
     return backend.softDelete(table, item.entityId, now)
   }
-
-  const payload = keysToSnake({ ...(item.payload as Record<string, unknown>), updatedAt: now })
-  // settings живут по одной строке на пользователя — ключ не id, а user_id (ставит сервер)
-  if (item.entityType === 'settings') delete payload.id
-
-  return backend.upsert(table, payload, item.entityType === 'settings' ? 'user_id' : 'id')
+  return backend.upsert(table, upsertPayload(item, now), item.entityType === 'settings' ? 'user_id' : 'id')
 }
 
 export type PushDecision =
@@ -169,6 +204,59 @@ export function pushDecision(res: PushOutcome | null): PushDecision {
   return { kind: 'rejected', message: res.message }
 }
 
+export interface PushChunk {
+  entityType: SyncEntity
+  operation: 'upsert' | 'delete'
+  items: SyncQueueItem[]
+}
+
+/**
+ * Раскладывает очередь на пачки. Чистая функция — покрыта тестами.
+ *
+ * В одну пачку попадают записи одной таблицы, одной операции и — для upsert —
+ * с ОДИНАКОВЫМ набором полей. Последнее обязательно: в пакетной вставке
+ * PostgREST приводит строки к общему набору колонок, и поле, которого в строке
+ * не было, записалось бы как NULL — затирая значение на сервере. У одиночного
+ * upsert такого нет (обновляются только присланные поля), и пачка обязана
+ * вести себя так же.
+ *
+ * Порядок пачек — по первому появлению в очереди. Между собой записи разных
+ * сущностей независимы (внешних ключей между таблицами нет), а по одной
+ * сущности в очереди всегда ровно одна запись: `enqueue` схлопывает прежние.
+ *
+ * `settings` не пакуются никогда: у них ключ конфликта `user_id`, а не `id`.
+ */
+export function planChunks(items: SyncQueueItem[]): PushChunk[] {
+  const groups = new Map<string, PushChunk>()
+  for (const item of items) {
+    const shape = item.operation === 'delete' ? ''
+      : item.entityType === 'settings' ? `solo:${item.id}`
+        : Object.keys((item.payload ?? {}) as Record<string, unknown>).sort().join(',')
+    const key = `${item.entityType}|${item.operation}|${shape}`
+    const g = groups.get(key)
+    if (g) g.items.push(item)
+    else groups.set(key, { entityType: item.entityType, operation: item.operation, items: [item] })
+  }
+
+  const out: PushChunk[] = []
+  for (const g of groups.values()) {
+    const size = g.operation === 'delete' ? DELETE_BATCH : PUSH_BATCH
+    for (let i = 0; i < g.items.length; i += size) {
+      out.push({ entityType: g.entityType, operation: g.operation, items: g.items.slice(i, i + size) })
+    }
+  }
+  return out
+}
+
+function pushChunk(backend: SyncBackend, chunk: PushChunk): Promise<PushOutcome | null> {
+  const table = TABLE[chunk.entityType]
+  const now = new Date().toISOString()
+  if (chunk.operation === 'delete') {
+    return backend.softDeleteMany(table, chunk.items.map(i => i.entityId), now)
+  }
+  return backend.upsertMany(table, chunk.items.map(i => upsertPayload(i, now)))
+}
+
 export interface PushResult {
   pushed: number
   failed: number
@@ -181,33 +269,34 @@ export async function push(backend: SyncBackend = supabaseBackend()): Promise<Pu
   let pushed = 0, failed = 0, dead = 0, netFailures = 0
   let lastNetError: string | undefined
 
-  const items = await db.syncQueue.where('dead').equals(0).sortBy('createdAt')
-  for (const item of items) {
-    const res = await pushItem(backend, item)
-    const decision = pushDecision(res)
+  /** Сетевой сбой: записи остаются в очереди. `true` — связи нет, круг пора прервать. */
+  async function onRetry(items: SyncQueueItem[], message: string): Promise<boolean> {
+    // retryCount намеренно НЕ растим: это сбой связи, а не плохая запись —
+    // иначе пара обрывов похоронит нормальные изменения.
+    await db.syncQueue.bulkUpdate(items.map(i => ({ key: i.id, changes: { lastError: message } })))
+    failed += items.length
+    netFailures++
+    lastNetError = message
+    if (netFailures >= NET_FAILURE_LIMIT) {
+      console.warn('[sync] связи нет — круг отправки прерван, записи остались в очереди')
+      return true
+    }
+    return false
+  }
+
+  /** Одна запись отдельным запросом. `true` — круг пора прервать. */
+  async function sendOne(item: SyncQueueItem): Promise<boolean> {
+    const decision = pushDecision(await pushItem(backend, item))
 
     if (decision.kind === 'sent') {
       await db.syncQueue.delete(item.id)
       pushed++
       netFailures = 0
-      continue
+      return false
     }
+    if (decision.kind === 'retry') return onRetry([item], decision.message)
 
     failed++
-
-    if (decision.kind === 'retry') {
-      // Запись остаётся в очереди. retryCount намеренно НЕ растим: это сбой связи,
-      // а не плохая запись — иначе пара обрывов похоронит нормальные изменения.
-      await db.syncQueue.update(item.id, { lastError: decision.message })
-      netFailures++
-      lastNetError = decision.message
-      if (netFailures >= NET_FAILURE_LIMIT) {
-        console.warn('[sync] связи нет — круг отправки прерван, записи остались в очереди')
-        return { pushed, failed, dead, netError: decision.message }
-      }
-      continue
-    }
-
     // «ядовитый» элемент больше не ретраим — иначе он навсегда заблокирует счётчик
     const retryCount = item.retryCount + 1
     if (retryCount >= MAX_RETRIES) {
@@ -217,19 +306,57 @@ export async function push(backend: SyncBackend = supabaseBackend()): Promise<Pu
     } else {
       await db.syncQueue.update(item.id, { retryCount, lastError: decision.message })
     }
+    return false
+  }
+
+  const aborted = (): PushResult =>
+    ({ pushed, failed, dead, netError: lastNetError ?? 'связь с сервером потеряна' })
+
+  const items = await db.syncQueue.where('dead').equals(0).sortBy('createdAt')
+  for (const chunk of planChunks(items)) {
+    // одиночная запись идёт прежним путём — пакетный запрос ей ничего не даёт
+    if (chunk.items.length === 1) {
+      if (await sendOne(chunk.items[0])) return aborted()
+      continue
+    }
+
+    const decision = pushDecision(await pushChunk(backend, chunk))
+
+    if (decision.kind === 'sent') {
+      await db.syncQueue.bulkDelete(chunk.items.map(i => i.id))
+      pushed += chunk.items.length
+      netFailures = 0
+      continue
+    }
+
+    if (decision.kind === 'retry') {
+      if (await onRetry(chunk.items, decision.message)) return aborted()
+      continue
+    }
+
+    /**
+     * Сервер отверг пачку по содержимому. Вставка атомарна: одна плохая строка
+     * валит все остальные, и по ответу не видно, какая именно. Поэтому
+     * досылаем пачку поштучно — хорошие записи уедут, а виновник получит свой
+     * `retryCount` и в итоге уйдёт в dead-letter один, не утянув соседей.
+     *
+     * Сам отказ пачки в `retryCount` НЕ считается: иначе одна битая запись
+     * похоронила бы двести нормальных.
+     */
+    for (const item of chunk.items) {
+      if (await sendOne(item)) return aborted()
+    }
   }
 
   /**
    * Связь подвела и НИ ОДНА запись не ушла — значит сервер недоступен, и идти
-   * дальше в pull незачем: там ещё восемь таблиц по своему таймауту.
+   * дальше в pull незачем: там ещё девять таблиц по своему таймауту.
    *
    * Порога `NET_FAILURE_LIMIT` для этого мало: он прерывает длинную очередь
    * на третьем сбое подряд, но при одной-двух записях не срабатывает вовсе —
    * и «Синхронизация…» всё равно висела минутами на pull'е.
    */
-  if (netFailures > 0 && pushed === 0) {
-    return { pushed, failed, dead, netError: lastNetError ?? 'связь с сервером потеряна' }
-  }
+  if (netFailures > 0 && pushed === 0) return aborted()
   return { pushed, failed, dead }
 }
 
@@ -261,81 +388,134 @@ async function watermark(entity: SyncEntity): Promise<string> {
     ?? '1970-01-01T00:00:00.000Z'
 }
 
-export async function pull(backend: SyncBackend = supabaseBackend()): Promise<PullReport> {
-  const blocked = await pendingIds()
-  let total = 0
-  const errors: string[] = []
+/** Когда закончился последний pull без ошибок, мс. Живёт в памяти вкладки. */
+let lastPullDone = 0
 
-  for (const entity of PULL_ORDER) {
-    const remote = TABLE[entity]
-    const local = LOCAL_TABLE[entity]
-    const since = await watermark(entity)
-    let newest = since
-    let from = 0
-    let clean = true
-    /**
-     * Встретили строку, которую не применили из-за неотправленных локальных
-     * правок — дальше водяной знак не двигаем. Строки приходят по возрастанию
-     * updated_at, поэтому первая такая задаёт потолок. Без этого знак уезжал
-     * вперёд, а если элемент очереди потом умирал (dead=1), он перестаёт
-     * блокировать pull — и серверная версия не приезжала уже никогда.
-     */
-    let frozen = false
+/**
+ * Удалённая на сервере операция → строка корзины. `null`, если строка
+ * неполная (остаток от старой схемы) или удалена слишком давно: первый pull
+ * на новом устройстве иначе притащил бы в корзину всё удалённое за годы.
+ */
+function toTrash(row: Record<string, unknown>, border: string): TrashedTransaction | null {
+  const at = new Date(String(row.deletedAt ?? ''))
+  if (Number.isNaN(at.getTime())) return null
+  const deletedAt = at.toISOString()
+  if (deletedAt < border) return null
+  if (typeof row.amount !== 'number' || !row.accountId || !row.type || !row.date) return null
+  return { id: String(row.id), tx: row as unknown as Transaction, deletedAt }
+}
 
-    for (;;) {
-      const res = await backend.fetchSince(remote, since, from, PAGE)
-      if (!res) { console.warn('[pull] таймаут на', remote); errors.push(`${remote}: таймаут`); clean = false; break }
-      if ('error' in res) { console.error('[pull]', remote, res.error); errors.push(`${remote}: ${res.error}`); clean = false; break }
+async function pullEntity(
+  backend: SyncBackend,
+  entity: SyncEntity,
+  blocked: Set<string>,
+): Promise<{ pulled: number; error?: string }> {
+  const remote = TABLE[entity]
+  const table = db.table(LOCAL_TABLE[entity])
+  const since = await watermark(entity)
+  const trashBorder = new Date(Date.now() - TRASH_KEEP_DAYS * 86_400_000).toISOString()
+  let newest = since
+  let from = 0
+  let pulled = 0
+  let error: string | undefined
+  /**
+   * Встретили строку, которую не применили из-за неотправленных локальных
+   * правок — дальше водяной знак не двигаем. Строки приходят по возрастанию
+   * updated_at, поэтому первая такая задаёт потолок. Без этого знак уезжал
+   * вперёд, а если элемент очереди потом умирал (dead=1), он перестаёт
+   * блокировать pull — и серверная версия не приезжала уже никогда.
+   */
+  let frozen = false
 
-      const rows = res.rows
-      if (!rows.length) break
+  for (;;) {
+    const res = await backend.fetchSince(remote, since, from, PAGE)
+    if (!res) { console.warn('[pull] таймаут на', remote); error = `${remote}: таймаут`; break }
+    if ('error' in res) { console.error('[pull]', remote, res.error); error = `${remote}: ${res.error}`; break }
 
-      const table = db.table(local)
-      const toPut: Record<string, unknown>[] = []
-      const toDelete: string[] = []
+    const rows = res.rows
+    if (!rows.length) break
 
-      for (const raw of rows) {
-        const updatedAt = String(raw.updated_at ?? '')
+    /** Строки страницы, которые можно применять: без неотправленных локальных правок. */
+    const fresh: { id: string | number; updatedAt: string; row: Record<string, unknown> }[] = []
 
-        const row = keysToCamel(raw)
-        const id = entity === 'settings' ? 1 : String(row.id ?? '')
-        delete row.userId
+    for (const raw of rows) {
+      const updatedAt = String(raw.updated_at ?? '')
 
-        if (entity === 'settings') row.id = 1
+      const row = keysToCamel(raw)
+      const id = entity === 'settings' ? 1 : String(row.id ?? '')
+      delete row.userId
 
-        // у настроек локальный ключ 1, а в очереди он лежит под строкой 'settings' —
-        // без этого несохранённые настройки затирались приходящими из облака
-        const queueKey = entity === 'settings' ? 'settings' : String(id)
-        if (blocked.has(queueKey)) {                     // локально есть неотправленные правки
-          frozen = true
-          continue
-        }
+      if (entity === 'settings') row.id = 1
 
-        if (!frozen && updatedAt > newest) newest = updatedAt
-
-        if (row.deletedAt) { toDelete.push(String(id)); continue }
-
-        const existing = await table.get(id as never) as Record<string, unknown> | undefined
-        if (existing && typeof existing.updatedAt === 'string' && existing.updatedAt > updatedAt) {
-          continue                                       // локальная версия свежее
-        }
-        toPut.push(row)
+      // у настроек локальный ключ 1, а в очереди он лежит под строкой 'settings' —
+      // без этого несохранённые настройки затирались приходящими из облака
+      const queueKey = entity === 'settings' ? 'settings' : String(id)
+      if (blocked.has(queueKey)) {                     // локально есть неотправленные правки
+        frozen = true
+        continue
       }
 
-      if (toPut.length) await table.bulkPut(toPut as never[])
-      if (toDelete.length) await table.bulkDelete(toDelete as never[])
-      total += toPut.length + toDelete.length
-
-      if (rows.length < PAGE) break
-      from += PAGE
+      if (!frozen && updatedAt > newest) newest = updatedAt
+      fresh.push({ id, updatedAt, row })
     }
 
-    // сдвигаем знак ТОЛЬКО если таблица дочитана целиком: повторно перечитать
-    // страницу дёшево и идемпотентно, потерять строку — нет
-    if (clean && newest > since) await setMeta(WM_PREFIX + entity, newest)
+    // локальные версии читаем одним запросом на страницу, а не по строке:
+    // на тысяче строк это была тысяча обращений к IndexedDB подряд
+    const alive = fresh.filter(f => !f.row.deletedAt)
+    const existing = await table.bulkGet(alive.map(f => f.id) as never[]) as (Record<string, unknown> | undefined)[]
+
+    const toPut: Record<string, unknown>[] = []
+    alive.forEach((f, i) => {
+      const local = existing[i]
+      if (local && typeof local.updatedAt === 'string' && local.updatedAt > f.updatedAt) return  // локальная версия свежее
+      toPut.push(f.row)
+    })
+    const gone = fresh.filter(f => f.row.deletedAt)
+    const toDelete = gone.map(f => String(f.id))
+
+    if (toPut.length) await table.bulkPut(toPut as never[])
+    if (toDelete.length) await table.bulkDelete(toDelete as never[])
+
+    /**
+     * Корзина сходится между устройствами здесь же: удалённая где-то операция
+     * приезжает tombstone'ом со всеми полями — кладём её в корзину; ожившая
+     * (её вернули на другом устройстве) — из корзины убираем.
+     */
+    if (entity === 'transaction') {
+      const trashed = gone.map(f => toTrash(f.row, trashBorder)).filter((t): t is TrashedTransaction => t !== null)
+      if (trashed.length) await db.trash.bulkPut(trashed)
+      if (toPut.length) await db.trash.bulkDelete(toPut.map(r => String(r.id)))
+    }
+
+    pulled += toPut.length + toDelete.length
+
+    if (rows.length < PAGE) break
+    from += PAGE
   }
 
-  return { pulled: total, error: errors.length ? errors.join('; ') : undefined }
+  // сдвигаем знак ТОЛЬКО если таблица дочитана целиком: повторно перечитать
+  // страницу дёшево и идемпотентно, потерять строку — нет
+  if (!error && newest > since) await setMeta(WM_PREFIX + entity, newest)
+  return { pulled, error }
+}
+
+/**
+ * Таблицы читаются ПАРАЛЛЕЛЬНО. У каждой свой водяной знак и своя локальная
+ * таблица, друг от друга они не зависят — а девять запросов подряд на мобильной
+ * сети давали несколько секунд «Синхронизации…» на каждом круге, даже когда
+ * менять было нечего. При мёртвой связи выигрыш ещё заметнее: один таймаут
+ * в 20 секунд вместо девяти подряд.
+ */
+export async function pull(backend: SyncBackend = supabaseBackend()): Promise<PullReport> {
+  const blocked = await pendingIds()
+  const results = await Promise.all(PULL_ORDER.map(entity => pullEntity(backend, entity, blocked)))
+
+  const errors = results.map(r => r.error).filter((e): e is string => Boolean(e))
+  if (!errors.length) lastPullDone = Date.now()
+  return {
+    pulled: results.reduce((s, r) => s + r.pulled, 0),
+    error: errors.length ? errors.join('; ') : undefined,
+  }
 }
 
 /** Полная отправка всего локального состояния — после первого входа на устройстве. */
@@ -359,19 +539,43 @@ export async function pushAll(): Promise<number> {
 }
 
 /**
+ * Круг уже идёт. Защита на уровне модуля, а не только хука: `bootstrapSync`
+ * при входе ограничен таймаутом в 15 секунд и после него продолжает работать
+ * в фоне — без общего замка первый же круг из `useSync` стартовал поверх него,
+ * и одна и та же очередь отправлялась дважды.
+ */
+let syncBusy = false
+
+export interface SyncOptions {
+  /**
+   * Не тянуть с сервера, если прошлый pull закончился меньше чем столько
+   * миллисекунд назад. `0` (по умолчанию) — тянуть всегда.
+   *
+   * Отправка своего идёт на каждом круге, а чтение чужого — реже: проверять
+   * девять таблиц раз в минуту незачем, когда на устройстве работает один человек.
+   */
+  minPullGapMs?: number
+}
+
+/**
  * Проверка «есть ли куда синхронизироваться» живёт здесь, а не внутри push/pull:
  * те работают с любым бэкендом, и сам факт переданного бэкенда означает,
  * что отправлять есть куда. Благодаря этому они гоняются в тестах.
  */
-export async function syncNow(): Promise<SyncReport> {
+export async function syncNow(opts: SyncOptions = {}): Promise<SyncReport> {
   if (!hasSupabase) return { pushed: 0, pulled: 0, failed: 0, dead: 0 }
   if (!navigator.onLine) return { pushed: 0, pulled: 0, failed: 0, dead: 0, error: 'offline' }
+  if (syncBusy) return { pushed: 0, pulled: 0, failed: 0, dead: 0, skipped: true }
+  syncBusy = true
   try {
     const backend = supabaseBackend()
     const { pushed, failed, dead, netError } = await push(backend)   // сначала отдаём своё
-    // Связи нет — не тратим ещё восемь таймаутов по 20 секунд на pull.
+    // Связи нет — не тратим ещё таймаут на pull.
     // Раньше именно это держало «Синхронизация…» минутами.
     if (netError) return { pushed, pulled: 0, failed, dead, error: netError }
+
+    const gap = opts.minPullGapMs ?? 0
+    if (gap > 0 && Date.now() - lastPullDone < gap) return { pushed, pulled: 0, failed, dead }
 
     const r = await pull(backend)                       // затем забираем чужое
     // ошибку pull'а больше не глотаем: иначе статус «online» врал,
@@ -380,22 +584,30 @@ export async function syncNow(): Promise<SyncReport> {
   } catch (e) {
     console.error('[sync]', e)
     return { pushed: 0, pulled: 0, failed: 0, dead: 0, error: String(e) }
+  } finally {
+    syncBusy = false
   }
 }
 
 /** Первый вход на устройстве: тянем облако, если локально пусто — иначе заливаем своё. */
 export async function bootstrapSync(): Promise<void> {
   if (!hasSupabase || !navigator.onLine) return
-  const backend = supabaseBackend()
-  await pull(backend)
-  const done = await getMeta('initialPushDone')
-  if (!done) {
-    const localCount = await db.transactions.count() + await db.accounts.count()
-    if (localCount > 0) await pushAll()
-    await setMeta('initialPushDone', '1')
-  }
-  await push(backend)
-  if (!(await db.settings.get(1))) {
-    await db.settings.put({ ...DEFAULT_SETTINGS, updatedAt: new Date().toISOString() })
+  if (syncBusy) return
+  syncBusy = true
+  try {
+    const backend = supabaseBackend()
+    await pull(backend)
+    const done = await getMeta('initialPushDone')
+    if (!done) {
+      const localCount = await db.transactions.count() + await db.accounts.count()
+      if (localCount > 0) await pushAll()
+      await setMeta('initialPushDone', '1')
+    }
+    await push(backend)
+    if (!(await db.settings.get(1))) {
+      await db.settings.put({ ...DEFAULT_SETTINGS, updatedAt: new Date().toISOString() })
+    }
+  } finally {
+    syncBusy = false
   }
 }

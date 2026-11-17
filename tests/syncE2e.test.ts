@@ -4,10 +4,12 @@ import { FakeBackend, pretendOnline } from './fakes/fakeBackend'
 pretendOnline()
 
 const { db } = await import('../src/db')
-const { push, pull } = await import('../src/db/sync')
+const { push, pull, planChunks, PUSH_BATCH } = await import('../src/db/sync')
 const { enqueue } = await import('../src/db/queue')
-const { createAccount } = await import('../src/db/accounts')
-const { addTransaction, deleteTransaction } = await import('../src/db/transactions')
+const { createAccount, computeBalances } = await import('../src/db/accounts')
+const {
+  addTransaction, deleteTransaction, restoreTransaction, purgeOldTrash, TRASH_KEEP_DAYS,
+} = await import('../src/db/transactions')
 const { toMinor } = await import('../src/utils/money')
 
 const checks: [string, boolean, string][] = []
@@ -174,6 +176,179 @@ const remoteTx = srv2.rows('transactions').find(r => r.id === tx2.id)
 eq('удаление уехало tombstone, а не физически', Boolean(remoteTx), true)
 eq('у записи проставлен deleted_at', Boolean(remoteTx?.deleted_at), true)
 eq('после удаления очередь пуста', await queueLen(), 0)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Отправка пачками: много записей — мало запросов
+// ─────────────────────────────────────────────────────────────────────────────
+await reset()
+await db.transactions.clear(); await db.postings.clear()
+for (let i = 0; i < 25; i++) {
+  await addTransaction({ type: 'expense', amount: toMinor('100') + i, categoryId: 'food', accountId: acc2.id, title: `Пачка ${i}` })
+}
+const queued = await queueLen()
+eq('пачка: в очереди операции и проводки', queued, 50)
+
+const bulk = new FakeBackend()
+const rb = await push(bulk)
+eq('пачка: ушло всё', rb.pushed, 50)
+eq('пачка: очередь пуста', await queueLen(), 0)
+eq('пачка: запросов на порядок меньше, чем записей', bulk.writes, 2)
+eq('пачка: операции на сервере', bulk.rows('transactions').length, 25)
+eq('пачка: проводки на сервере', bulk.rows('postings').length, 25)
+eq('пачка: суммы не перепутаны', bulk.rows('transactions').map(r => r.amount).sort((a, b) => Number(a) - Number(b))[24], toMinor('100') + 24)
+
+// раскладка: записи с разным набором полей в одну пачку не попадают
+const mk = (id: string, entityType: 'account' | 'settings', payload: Record<string, unknown>, operation: 'upsert' | 'delete' = 'upsert') =>
+  ({ id, entityType, entityId: id, operation, payload, createdAt: id, retryCount: 0, lastError: null, dead: 0 as const })
+const plan = planChunks([
+  mk('1', 'account', { id: '1', name: 'A' }),
+  mk('2', 'account', { id: '2', name: 'B', creditLimit: 5 }),
+  mk('3', 'account', { id: '3', name: 'C' }),
+  mk('4', 'account', null as never, 'delete'),
+  mk('5', 'settings', { id: 1, userName: 'x' }),
+])
+eq('раскладка: одинаковые по полям — вместе', plan[0].items.map(i => i.id), ['1', '3'])
+eq('раскладка: лишнее поле — отдельная пачка', plan[1].items.map(i => i.id), ['2'])
+eq('раскладка: удаления отдельно от вставок', plan[2].operation, 'delete')
+eq('раскладка: настройки всегда поодиночке', plan[3].items.length, 1)
+const big = planChunks(Array.from({ length: PUSH_BATCH + 5 }, (_, i) => mk(`b${i}`, 'account', { id: `b${i}` })))
+eq('раскладка: длинная очередь режется на пачки', big.map(c => c.items.length), [PUSH_BATCH, 5])
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Одна битая запись не хоронит соседей по пачке
+// ─────────────────────────────────────────────────────────────────────────────
+await reset()
+for (let i = 0; i < 6; i++) await enqueue('account', `p${i}`, 'upsert', { id: `p${i}`, name: `Счёт ${i}` })
+const strict = new FakeBackend()
+strict.poison = p => p.id === 'p3'
+const rp = await push(strict)
+eq('яд: хорошие записи доехали', strict.rows('accounts').length, 5)
+eq('яд: в очереди остался только виновник', (await db.syncQueue.toArray()).map(i => i.entityId), ['p3'])
+eq('яд: соседи не получили штрафных попыток', rp.pushed, 5)
+eq('яд: виновник получил одну попытку, а не dead сразу', (await db.syncQueue.toArray())[0].retryCount, 1)
+for (let i = 0; i < 5; i++) await push(strict)
+eq('яд: после MAX_RETRIES виновник в dead', await deadLen(), 1)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Обрыв связи на пачке: ничего не теряется и не штрафуется
+// ─────────────────────────────────────────────────────────────────────────────
+await reset()
+for (let i = 0; i < 8; i++) await enqueue('account', `n${i}`, 'upsert', { id: `n${i}`, name: `Сеть ${i}` })
+const down = new FakeBackend()
+down.failWrites({ kind: 'silent' }, 5)
+const rn = await push(down)
+eq('обрыв пачки: все записи в очереди', await queueLen(), 8)
+eq('обрыв пачки: сообщено, что связи нет', Boolean(rn.netError), true)
+eq('обрыв пачки: попытки не считаются', (await db.syncQueue.toArray()).every(i => i.retryCount === 0), true)
+eq('обрыв пачки: сервер тронут один раз', down.writes, 1)
+await push(new FakeBackend())
+eq('обрыв пачки: после возврата связи всё уехало', await queueLen(), 0)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Корзина: удалённую операцию можно вернуть, баланс сходится
+// ─────────────────────────────────────────────────────────────────────────────
+await reset()
+await db.accounts.clear(); await db.transactions.clear(); await db.postings.clear(); await db.trash.clear()
+const acc3 = await createAccount({ kind: 'debit', name: 'Корзина', bank: 'other', openingBalance: toMinor('5000') })
+const acc4 = await createAccount({ kind: 'debit', name: 'Второй', bank: 'other', openingBalance: toMinor('0') })
+const gone = await addTransaction({ type: 'expense', amount: toMinor('1200'), categoryId: 'food', accountId: acc3.id, title: 'Ужин' })
+const moved = await addTransaction({ type: 'transfer', amount: toMinor('700'), categoryId: 'transfer', accountId: acc3.id, toAccountId: acc4.id })
+const srv3 = new FakeBackend()
+await push(srv3)
+
+await deleteTransaction(gone.id)
+eq('корзина: операция исчезла из истории', await db.transactions.get(gone.id), undefined)
+eq('корзина: баланс вернулся', (await computeBalances()).get(acc3.id), toMinor('5000') - toMinor('700'))
+eq('корзина: операция лежит в корзине', (await db.trash.get(gone.id))?.tx.title, 'Ужин')
+await push(srv3)
+eq('корзина: на сервер ушёл tombstone', Boolean(srv3.rows('transactions').find(r => r.id === gone.id)?.deleted_at), true)
+
+const back2 = await restoreTransaction(gone.id)
+eq('возврат: операция снова в истории', (await db.transactions.get(gone.id))?.amount, toMinor('1200'))
+eq('возврат: deletedAt снят', back2.deletedAt, null)
+eq('возврат: проводка собрана заново', (await db.postings.where('transactionId').equals(gone.id).toArray()).length, 1)
+eq('возврат: баланс снова учитывает расход', (await computeBalances()).get(acc3.id), toMinor('5000') - toMinor('700') - toMinor('1200'))
+eq('возврат: корзина пуста', await db.trash.count(), 0)
+await push(srv3)
+eq('возврат: на сервере строка ожила', srv3.rows('transactions').find(r => r.id === gone.id)?.deleted_at, null)
+eq('возврат: очередь пуста', await queueLen(), 0)
+
+// перевод возвращается двумя ногами — деньги не появляются из воздуха
+await deleteTransaction(moved.id)
+eq('корзина: перевод снят с обоих счетов', (await computeBalances()).get(acc4.id), 0)
+await restoreTransaction(moved.id)
+const balAfter = await computeBalances()
+eq('возврат перевода: две ноги', (await db.postings.where('transactionId').equals(moved.id).toArray()).length, 2)
+eq('возврат перевода: сумма по кабинету не изменилась',
+  (balAfter.get(acc3.id) ?? 0) + (balAfter.get(acc4.id) ?? 0), toMinor('5000') - toMinor('1200'))
+
+// повторный возврат и возврат несуществующего
+let restoreError = ''
+try { await restoreTransaction('нет-такой') } catch (e) { restoreError = (e as Error).message }
+eq('возврат: чего нет в корзине — понятная ошибка', restoreError, 'Операции нет в корзине')
+
+// счёт удалён — вернуть некуда, и корзина при этом не теряет запись
+const orphan = await addTransaction({ type: 'expense', amount: toMinor('50'), categoryId: 'food', accountId: acc4.id, title: 'Сирота' })
+await deleteTransaction(orphan.id)
+await db.accounts.delete(acc4.id)
+let orphanError = ''
+try { await restoreTransaction(orphan.id) } catch (e) { orphanError = (e as Error).message }
+eq('возврат: без счёта не возвращаем', orphanError.includes('вернуть её некуда'), true)
+eq('возврат: запись осталась в корзине', Boolean(await db.trash.get(orphan.id)), true)
+
+// старое выметается, свежее остаётся
+await db.trash.clear()
+const DAY = 86_400_000
+const NOW = Date.parse('2026-11-14T12:00:00.000Z')
+const stub = (id: string, daysAgo: number) => ({
+  id, deletedAt: new Date(NOW - daysAgo * DAY).toISOString(),
+  tx: { ...orphan, id },
+})
+await db.trash.bulkPut([stub('свежая', 3), stub('старая', TRASH_KEEP_DAYS + 1)])
+eq('уборка корзины: выброшена одна', await purgeOldTrash(NOW), 1)
+eq('уборка корзины: свежая на месте', (await db.trash.toArray()).map(t => t.id), ['свежая'])
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Корзина сходится между устройствами через pull
+// ─────────────────────────────────────────────────────────────────────────────
+await reset()
+await db.transactions.clear(); await db.postings.clear(); await db.trash.clear()
+const recent = new Date(Date.now() - 2 * DAY).toISOString()
+const ancient = new Date(Date.now() - (TRASH_KEEP_DAYS + 30) * DAY).toISOString()
+const remoteTxRow = (id: string, over: Record<string, unknown>) => ({
+  id, type: 'expense', amount: toMinor('300'), category_id: 'food', account_id: acc3.id,
+  title: id, date: recent, exclude_from_stats: 0, source: 'manual',
+  created_at: recent, updated_at: recent, deleted_at: null, user_id: 'u1', ...over,
+})
+const far = new FakeBackend()
+far.seed('transactions', remoteTxRow('живая', {}))
+far.seed('transactions', remoteTxRow('удалена-там', { deleted_at: recent }))
+far.seed('transactions', remoteTxRow('удалена-давно', { deleted_at: ancient, updated_at: ancient }))
+await pull(far)
+eq('pull: живая операция приехала', Boolean(await db.transactions.get('живая')), true)
+eq('pull: удалённая на другом устройстве попала в корзину', (await db.trash.get('удалена-там'))?.tx.amount, toMinor('300'))
+eq('pull: в историю она не попала', await db.transactions.get('удалена-там'), undefined)
+eq('pull: давно удалённое в корзину не тащим', await db.trash.get('удалена-давно'), undefined)
+
+// на другом устройстве операцию вернули — из корзины она уходит
+const later = new Date(Date.now() - DAY).toISOString()
+far.seed('transactions', remoteTxRow('удалена-там', { updated_at: later }))
+await pull(far)
+eq('pull: возвращённая там операция ожила здесь', Boolean(await db.transactions.get('удалена-там')), true)
+eq('pull: и ушла из корзины', await db.trash.get('удалена-там'), undefined)
+
+// таблицы читаются независимо: сбой одной не мешает остальным
+await reset()
+await db.accounts.clear(); await db.transactions.clear()
+const half = new FakeBackend()
+half.seed('accounts', { id: 'acc-ok', name: 'Доехал', updated_at: '2026-05-01T00:00:00.000Z', deleted_at: null })
+half.seed('transactions', remoteTxRow('tx-late', {}))
+half.failReads({ kind: 'silent' }, 1, 'transactions')
+const pHalf = await pull(half)
+eq('сбой одной таблицы: остальные приехали', Boolean(await db.accounts.get('acc-ok')), true)
+eq('сбой одной таблицы: ошибка названа', String(pHalf.error).includes('transactions'), true)
+eq('сбой одной таблицы: её знак не сдвинут', await db.meta.get('pullAt:transaction'), undefined)
+eq('сбой одной таблицы: знак соседней сдвинут', Boolean(await db.meta.get('pullAt:account')), true)
 
 let failed = 0
 for (const [name, pass, d] of checks) { console.log(`${pass ? '  ok  ' : ' FAIL '} ${name}${pass ? '' : ' — ' + d}`); if (!pass) failed++ }

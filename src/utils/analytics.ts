@@ -148,6 +148,110 @@ export function byDay(txs: Transaction[], range: Range): DayPoint[] {
   return out
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Ряды для графиков
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface SeriesPoint {
+  /**
+   * Ключ точки: `YYYY-MM-DD` у дня, `YYYY-MM` у месяца. Операция принадлежит
+   * точке, если её местная дата НАЧИНАЕТСЯ с ключа, — поэтому одна и та же
+   * проверка (`inBucket`) раскрывает и день, и месяц.
+   */
+  key: string
+  label: string
+  expense: Minor
+  income: Minor
+  cumulative: Minor
+}
+
+export type SeriesStep = 'day' | 'month'
+
+/** Длиннее этого периода столбик на день не разглядеть — группируем по месяцам. */
+export const SERIES_DAY_LIMIT = 93
+
+const MONTH_SHORT = ['янв', 'фев', 'мар', 'апр', 'май', 'июн', 'июл', 'авг', 'сен', 'окт', 'ноя', 'дек']
+
+/** Подпись месяца по ключу `YYYY-MM`: «ноя», а для чужого года — «ноя 25». */
+function monthLabel(key: string, withYear: boolean): string {
+  const [y, m] = key.split('-')
+  const name = MONTH_SHORT[Number(m) - 1] ?? key
+  return withYear ? `${name} ${y.slice(2)}` : name
+}
+
+/**
+ * Ряд для графика периода: по дням, а если период длиннее квартала — по месяцам.
+ * Шкала непрерывная, пустые дни и месяцы остаются нулями: дырка в оси читается
+ * как «тут ничего не тратили», а пропуск точки — как ошибка.
+ */
+export function timeSeries(txs: Transaction[], range: Range): { step: SeriesStep; points: SeriesPoint[] } {
+  const days = byDay(txs, range)
+  if (days.length <= SERIES_DAY_LIMIT) {
+    return {
+      step: 'day',
+      points: days.map(d => ({ key: d.date, label: d.label, expense: d.expense, income: d.income, cumulative: d.cumulative })),
+    }
+  }
+  const points: SeriesPoint[] = []
+  const years = new Set(days.map(d => d.date.slice(0, 4)))
+  for (const d of days) {
+    const key = d.date.slice(0, 7)
+    let p = points[points.length - 1]
+    if (!p || p.key !== key) {
+      p = { key, label: monthLabel(key, years.size > 1), expense: 0, income: 0, cumulative: 0 }
+      points.push(p)
+    }
+    p.expense += d.expense
+    p.income += d.income
+    p.cumulative = d.cumulative           // накопленное на последний день месяца
+  }
+  return { step: 'month', points }
+}
+
+/** Принадлежит ли операция точке ряда (дню или месяцу) — по местной дате. */
+export function inBucket(t: Transaction, key: string): boolean {
+  return isoDateOnly(t.date).startsWith(key)
+}
+
+/**
+ * Итоги по последним `months` месяцам, включая текущий, от старых к свежим.
+ * `now` — параметр, чтобы расчёт не зависел от часов в тесте.
+ */
+export function monthlyTotals(allTxs: Transaction[], months: number, now: Date = new Date()): SeriesPoint[] {
+  const points: SeriesPoint[] = []
+  const index = new Map<string, SeriesPoint>()
+  for (let i = months - 1; i >= 0; i--) {
+    const d = new Date(now.getFullYear(), now.getMonth() - i, 1)
+    const key = dateKey(d).slice(0, 7)
+    const p: SeriesPoint = {
+      key, label: monthLabel(key, d.getFullYear() !== now.getFullYear()),
+      expense: 0, income: 0, cumulative: 0,
+    }
+    points.push(p)
+    index.set(key, p)
+  }
+  for (const t of statsOnly(allTxs)) {
+    const p = index.get(isoDateOnly(t.date).slice(0, 7))
+    if (!p) continue
+    if (t.type === 'expense') p.expense += t.amount
+    if (t.type === 'income') p.income += t.amount
+  }
+  let cumulative = 0
+  for (const p of points) { cumulative += p.expense; p.cumulative = cumulative }
+  return points
+}
+
+/**
+ * Самые крупные траты выборки, по убыванию. Те же правила, что у
+ * `biggestExpense`: без переводов и операций вне статистики, тай-брейк по id.
+ */
+export function topExpenses(txs: Transaction[], limit: number): Transaction[] {
+  return statsOnly(txs)
+    .filter(t => t.type === 'expense')
+    .sort((a, b) => b.amount - a.amount || a.id.localeCompare(b.id))
+    .slice(0, limit)
+}
+
 export interface DayBlockCategory { categoryId: string; amount: Minor; count: number }
 
 export interface DayBlock {

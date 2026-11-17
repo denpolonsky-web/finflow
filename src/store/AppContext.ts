@@ -14,8 +14,23 @@ export interface AppState {
   closeAdd: () => void
   editTx: Transaction | null
   setEditTx: (t: Transaction | null) => void
-  toast: string | null
-  showToast: (msg: string) => void
+  toast: Toast | null
+  /**
+   * `action` — кнопка прямо в уведомлении («Вернуть» после удаления). С ней
+   * уведомление висит дольше: на то, чтобы заметить и нажать, нужно время.
+   */
+  showToast: (msg: string, action?: ToastAction) => void
+  hideToast: () => void
+}
+
+export interface ToastAction {
+  label: string
+  run: () => void
+}
+
+export interface Toast {
+  msg: string
+  action?: ToastAction
 }
 
 export const AppCtx = createContext<AppState | null>(null)

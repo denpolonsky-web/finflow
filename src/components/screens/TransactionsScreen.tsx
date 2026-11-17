@@ -1,9 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useLiveQuery } from 'dexie-react-hooks'
-import { Search, ChevronLeft, ChevronRight } from 'lucide-react'
+import { Search, ChevronLeft, ChevronRight, Trash2, RotateCcw } from 'lucide-react'
 import { db } from '../../db'
 import { categoryName } from '../../db/categories'
-import { formatMoney, formatSigned, plural } from '../../utils/format'
+import {
+  restoreTransaction, dropFromTrash, emptyTrash, TRASH_KEEP_DAYS, LedgerError,
+} from '../../db/transactions'
+import { CategoryIcon } from '../ui/CategoryIcon'
+import { formatDate, formatMoney, formatSigned, isoDateOnly, formatDayKey, plural } from '../../utils/format'
 import { getRange } from '../../utils/period'
 import { totals } from '../../utils/analytics'
 import { useApp } from '../../store/AppContext'
@@ -12,28 +16,113 @@ import { useProfile } from '../../store/ProfileContext'
 import { ScopePicker } from '../ui/ScopePicker'
 import { TxList } from '../ui/TxList'
 import { cutAtDayEnd } from '../../utils/txGroups'
-import { loadAmountColors } from '../../utils/uiPrefs'
-import type { PeriodId } from '../../types'
+import { loadAmountColors, loadPeriods, PERIOD_OPTIONS } from '../../utils/uiPrefs'
+import type { PeriodId, TrashedTransaction } from '../../types'
 
 /**
  * `all` — вся история без ограничения по дате, и это положение по умолчанию.
  * Раньше экран открывался на текущем месяце, и чтобы увидеть прошлые операции,
  * нужно было догадаться листать период стрелками.
  */
-type Tab = 'all' | PeriodId
-
-const TABS: { id: Tab; label: string }[] = [
-  { id: 'all', label: 'Всё время' },
-  { id: 'week', label: 'Неделя' },
-  { id: 'month', label: 'Месяц' },
-  { id: 'quarter', label: 'Квартал' },
-  { id: 'year', label: 'Год' },
-]
+type Tab = 'all' | 'trash' | PeriodId
 
 type Filter = 'all' | 'expense' | 'income' | 'transfer'
 
 /** Сколько операций дорисовываем за один шаг бесконечной прокрутки. */
 const PAGE = 40
+
+/**
+ * Корзина: удалённые операции с кнопкой «Вернуть».
+ *
+ * Отдельный список, а не `TxList`: группировать по дню операции тут не по чему —
+ * важна дата удаления, а не дата самой траты. И действие другое: не правка,
+ * а возврат.
+ */
+function TrashList({ items, accounts }: {
+  items: TrashedTransaction[] | undefined
+  accounts: { id: string; name: string }[]
+}) {
+  const { showToast } = useApp()
+  const accName = new Map(accounts.map(a => [a.id, a.name]))
+
+  async function restore(id: string) {
+    try {
+      await restoreTransaction(id)
+      showToast('Операция возвращена')
+    } catch (e) {
+      showToast(e instanceof LedgerError ? e.message : 'Не удалось вернуть операцию')
+    }
+  }
+
+  if (items === undefined) {
+    return <p className="text-text-muted text-xs text-center py-16">Загружаем…</p>
+  }
+  if (!items.length) {
+    return (
+      <div className="text-center py-16">
+        <p className="text-4xl mb-2">🗑️</p>
+        <p className="text-text-secondary">Корзина пуста</p>
+        <p className="text-text-muted text-xs mt-1">
+          Удалённые операции лежат здесь {TRASH_KEEP_DAYS} дней, потом исчезают сами
+        </p>
+      </div>
+    )
+  }
+
+  return (
+    <div className="flex flex-col gap-3">
+      <div className="flex items-center justify-between">
+        <p className="text-text-muted text-[11px]">
+          Хранится {TRASH_KEEP_DAYS} дней. Возврат пересобирает проводки — баланс сходится.
+        </p>
+        <button
+          onClick={() => {
+            if (confirm(`Очистить корзину? ${items.length} ${plural(items.length, 'операция исчезнет', 'операции исчезнут', 'операций исчезнет')} насовсем.`)) {
+              void emptyTrash()
+            }
+          }}
+          className="text-accent-red text-xs underline flex-none">
+          Очистить
+        </button>
+      </div>
+
+      <div className="rounded-2xl bg-bg-card border border-border overflow-hidden">
+        {items.map((it, i) => (
+          <div key={it.id}
+            className={`flex items-center gap-3 p-4 ${i < items.length - 1 ? 'border-b border-border' : ''}`}>
+            <div className="w-10 h-10 rounded-xl bg-bg-card2 flex items-center justify-center flex-none overflow-hidden opacity-60">
+              <CategoryIcon id={it.tx.categoryId} size={26} />
+            </div>
+            <div className="flex-1 min-w-0">
+              <p className="text-text-secondary text-sm font-medium truncate line-through">
+                {it.tx.title || categoryName(it.tx.categoryId)}
+              </p>
+              {/* две строки вместо одной: в строку это не влезало и обрывалось
+                  на «Сегодня · …», а дата удаления тут и есть главное */}
+              <p className="text-text-muted text-[11px] truncate">
+                {formatDayKey(isoDateOnly(it.tx.date))} · {accName.get(it.tx.accountId) ?? 'счёт удалён'}
+              </p>
+              <p className="text-text-muted text-[11px] truncate">
+                удалена {formatDate(it.deletedAt).toLowerCase()}
+              </p>
+            </div>
+            <p className="text-xs font-semibold flex-none text-text-muted">
+              {formatMoney(it.tx.amount, true)}
+            </p>
+            <button onClick={() => void restore(it.id)} aria-label="Вернуть операцию"
+              className="w-9 h-9 rounded-xl bg-accent/15 text-accent flex items-center justify-center flex-none">
+              <RotateCcw size={15} />
+            </button>
+            <button onClick={() => void dropFromTrash(it.id)} aria-label="Убрать из корзины насовсем"
+              className="w-9 h-9 rounded-xl bg-bg-card2 text-text-muted flex items-center justify-center flex-none">
+              <Trash2 size={14} />
+            </button>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
 
 export function TransactionsScreen() {
   const { setEditTx } = useApp()
@@ -48,7 +137,16 @@ export function TransactionsScreen() {
 
   const colors = useMemo(() => loadAmountColors(), [])
   const accounts = useAccounts(true)
-  const isAll = tab === 'all'
+  const isTrash = tab === 'trash'
+  const isAll = tab === 'all' || isTrash
+
+  /** Вкладки периодов — те же, что настроены в аналитике, плюс «Всё время». */
+  const tabs = useMemo<{ id: Tab; label: string }[]>(() => [
+    { id: 'all', label: 'Всё время' },
+    ...loadPeriods()
+      .filter(p => p !== 'custom' && p !== 'day')
+      .map(p => ({ id: p as Tab, label: PERIOD_OPTIONS.find(o => o.id === p)!.label })),
+  ], [])
 
   /** Любое изменение выборки возвращает ленту в начало: иначе человек остался бы
    *  на сороковой позиции уже другого списка. */
@@ -65,6 +163,9 @@ export function TransactionsScreen() {
    * «Операций пока нет» с нулями в плитках — при полной истории операций.
    * `undefined` означает «ещё читаем», и это состояние рисуется отдельно.
    */
+  const trash = useLiveQuery(() => db.trash.orderBy('deletedAt').reverse().toArray(), [])
+  const trashCount = trash?.length ?? 0
+
   const rawTransactions = useLiveQuery(
     () => (isAll
       ? db.transactions.orderBy('date').reverse().toArray()
@@ -138,22 +239,31 @@ export function TransactionsScreen() {
 
       <ScopePicker />
 
-      <div className="relative">
-        <Search size={16} className="absolute left-4 top-1/2 -translate-y-1/2 text-text-muted" />
-        <input value={search} onChange={e => { setSearch(e.target.value); reset() }}
-          placeholder="Поиск по названию, категории, комментарию"
-          className="w-full bg-bg-card border border-border rounded-2xl pl-10 pr-4 py-3 text-text-primary text-sm placeholder:text-text-muted outline-none focus:ring-1 focus:ring-accent" />
-      </div>
+      {!isTrash && (
+        <div className="relative">
+          <Search size={16} className="absolute left-4 top-1/2 -translate-y-1/2 text-text-muted" />
+          <input value={search} onChange={e => { setSearch(e.target.value); reset() }}
+            placeholder="Поиск по названию, категории, комментарию"
+            className="w-full bg-bg-card border border-border rounded-2xl pl-10 pr-4 py-3 text-text-primary text-sm placeholder:text-text-muted outline-none focus:ring-1 focus:ring-accent" />
+        </div>
+      )}
 
       {/* Подразделы периода по центру, а не прижаты к левому краю */}
       <div className="flex flex-wrap justify-center gap-2">
-        {TABS.map(p => (
+        {tabs.map(p => (
           <button key={p.id} onClick={() => { setTab(p.id); setOffset(0); reset() }}
             className={`px-4 py-2 rounded-xl text-sm font-medium transition-all ${
               tab === p.id ? 'bg-accent text-white' : 'bg-bg-card text-text-secondary border border-border'}`}>
             {p.label}
           </button>
         ))}
+        {/* Корзина — такая же вкладка: удалённое не прячется в настройках,
+            искать его там никто бы не стал */}
+        <button onClick={() => { setTab('trash'); reset() }}
+          className={`px-4 py-2 rounded-xl text-sm font-medium transition-all flex items-center gap-1.5 ${
+            isTrash ? 'bg-accent text-white' : 'bg-bg-card text-text-secondary border border-border'}`}>
+          <Trash2 size={13} /> Удалённые{trashCount ? ` (${trashCount})` : ''}
+        </button>
       </div>
 
       {/* Навигация по периодам нужна только когда период выбран */}
@@ -172,6 +282,8 @@ export function TransactionsScreen() {
         </div>
       )}
 
+      {/* Поиск, фильтры и итоги относятся к истории; в корзине им нечего фильтровать */}
+      {!isTrash && (<>
       <div className="flex gap-2 overflow-x-auto scrollbar-none">
         {([['all', 'Все'], ['expense', '↓ Расходы'], ['income', '↑ Доходы'], ['transfer', '⇄ Переводы']] as const).map(([id, label]) => (
           <button key={id} onClick={() => { setFilter(id); reset() }}
@@ -219,8 +331,11 @@ export function TransactionsScreen() {
           </p>
         </div>
       </div>
+      </>)}
 
-      {loading ? (
+      {isTrash ? (
+        <TrashList items={trash} accounts={accounts ?? []} />
+      ) : loading ? (
         <p className="text-text-muted text-xs text-center py-16">Загружаем операции…</p>
       ) : filtered.length === 0 ? (
         <div className="text-center py-16">

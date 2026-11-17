@@ -3,6 +3,7 @@ import { v4 as uuid } from 'uuid'
 import type {
   Account, Transaction, Posting, Goal, Budget,
   BalanceSnapshot, AppSettings, SyncQueueItem, MetaRow, Profile, CategoryRow,
+  TrashedTransaction,
 } from '../types'
 
 /**
@@ -22,6 +23,7 @@ class FinFlowDB extends Dexie {
   meta!: Table<MetaRow, string>
   profiles!: Table<Profile, string>
   categories!: Table<CategoryRow, string>
+  trash!: Table<TrashedTransaction, string>
 
   constructor() {
     super('FinFlowDB')
@@ -80,6 +82,15 @@ class FinFlowDB extends Dexie {
         categories: 'id, type, isArchived, isCustom, sortOrder, updatedAt',
       })
       .upgrade(migrateV4toV5)
+
+    // v6 — корзина удалённых операций. Только локальная: в Supabase парной
+    // таблицы нет и не нужно — удаление там и так лежит tombstone'ом, а `pull`
+    // раскладывает такие строки сюда. Создаётся пустой, переносить нечего.
+    this.version(6)
+      .stores({
+        trash: 'id, deletedAt',
+      })
+      .upgrade(migrateV5toV6)
   }
 }
 
@@ -257,6 +268,15 @@ async function migrateV4toV5() {
   console.info('[migrate v4→v5] справочник категорий подключён')
 }
 
+/**
+ * v5 → v6. Корзина начинается пустой: операции, удалённые до этой версии,
+ * локально уже стёрты физически, и взять их неоткуда. Те, что удалены
+ * на сервере, приедут сами ближайшим полным `pull`.
+ */
+async function migrateV5toV6() {
+  console.info('[migrate v5→v6] корзина удалённых операций подключена')
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Настройки / meta
 // ─────────────────────────────────────────────────────────────────────────────
@@ -291,13 +311,15 @@ export async function wipeLocal(): Promise<void> {
   await db.transaction('rw', [
     db.accounts, db.transactions, db.postings, db.goals,
     db.budgets, db.snapshots, db.settings, db.syncQueue, db.meta, db.profiles,
-    db.categories,
+    db.categories, db.trash,
   ], async () => {
     await Promise.all([
       db.accounts.clear(), db.transactions.clear(), db.postings.clear(),
       db.goals.clear(), db.budgets.clear(), db.snapshots.clear(),
       db.settings.clear(), db.syncQueue.clear(), db.meta.clear(),
       db.profiles.clear(), db.categories.clear(),
+      // корзина — тоже чужая история: при смене аккаунта она не должна остаться
+      db.trash.clear(),
     ])
   })
 }

@@ -2,6 +2,7 @@ import {
   startOfWeek, endOfWeek, startOfMonth, endOfMonth,
   startOfQuarter, endOfQuarter, startOfYear, endOfYear,
   addMonths, addWeeks, addQuarters, addYears, format, isSameMonth,
+  addDays, startOfDay, endOfDay,
 } from 'date-fns'
 import { ru } from 'date-fns/locale'
 import type { PeriodId, Range } from '../types'
@@ -13,6 +14,15 @@ import type { PeriodId, Range } from '../types'
 export function getRange(period: PeriodId, offset = 0, customFrom?: string, customTo?: string): Range {
   const now = new Date()
   switch (period) {
+    case 'day': {
+      const base = addDays(now, offset)
+      return {
+        from: startOfDay(base), to: endOfDay(base),
+        label: offset === 0 ? 'Сегодня'
+          : offset === -1 ? 'Вчера'
+            : format(base, 'd MMMM yyyy', { locale: ru }),
+      }
+    }
     case 'week': {
       const base = addWeeks(now, offset)
       const from = startOfWeek(base, { weekStartsOn: 1 })

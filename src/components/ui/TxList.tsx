@@ -1,6 +1,6 @@
 import { Fragment } from 'react'
 import { Pencil } from 'lucide-react'
-import { categoryName } from '../../db/categories'
+import { categoryColor, categoryName } from '../../db/categories'
 import { CategoryIcon } from './CategoryIcon'
 import { formatMoney, formatDayKey, formatTime, monthTitle } from '../../utils/format'
 import { groupByDay } from '../../utils/txGroups'
@@ -75,7 +75,8 @@ export function TxList({
                 <div className="h-px bg-border flex-1" />
               </div>
             )}
-            <div>
+            {/* data-day — якорь: шит с детализацией прокручивает список к дню */}
+            <div data-day={g.date}>
               <div className="flex items-center justify-between mb-2">
                 <p className="text-text-secondary text-xs uppercase tracking-widest">
                   {formatDayKey(g.date)}
@@ -105,7 +106,13 @@ export function TxList({
                         вместо 182 350 ₽ скрывает ровно то, за чем сюда и пришли.
                         Сокращение остаётся в итогах дня и в плитках. */}
                     <p className="text-sm font-semibold flex-none"
-                      style={{ color: amountColor(tx.type, colors) }}>
+                      style={{
+                        /* «по цвету категории» — только расходам: у дохода и
+                           перевода цвет несёт знак, а не смысл покупки */
+                        color: colors.byCategory && tx.type === 'expense'
+                          ? categoryColor(tx.categoryId)
+                          : amountColor(tx.type, colors),
+                      }}>
                       {tx.type === 'income' ? '+' : tx.type === 'expense' ? '−' : ''}
                       {formatMoney(tx.amount)}
                     </p>

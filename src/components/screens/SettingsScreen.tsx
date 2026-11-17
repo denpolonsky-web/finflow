@@ -26,8 +26,10 @@ import { groupMoney, sanitizeMoneyInput, minorToInput } from '../../utils/money'
 import {
   WIDGETS, loadWidgetPrefs, saveWidgetPrefs,
   AMOUNT_COLOR_FIELDS, DEFAULT_AMOUNT_COLORS, loadAmountColors, saveAmountColors,
-  type AmountColors, type WidgetId, type WidgetPrefs,
+  NAV_TABS, loadNavTabs, saveNavTabs,
+  type AmountColorId, type AmountColors, type NavTabId, type WidgetId, type WidgetPrefs,
 } from '../../utils/uiPrefs'
+import { PickList } from '../ui/PickList'
 import type { SyncStatus } from '../../hooks/useSync'
 import type { Category, Minor, Profile } from '../../types'
 
@@ -88,6 +90,7 @@ export function SettingsScreen({ syncStatus, pending, dead, lastError, onSync, o
   const [busy, setBusy] = useState(false)
   const [widgets, setWidgets] = useState<WidgetPrefs>(loadWidgetPrefs)
   const [colors, setColors] = useState<AmountColors>(loadAmountColors)
+  const [nav, setNav] = useState<NavTabId[]>(loadNavTabs)
   const [editCategory, setEditCategory] = useState<Category | null>(null)
   const [creatingCategory, setCreatingCategory] = useState(false)
   const [showHidden, setShowHidden] = useState(false)
@@ -109,7 +112,11 @@ export function SettingsScreen({ syncStatus, pending, dead, lastError, onSync, o
   }
 
   /** Цвета читаются экранами при монтировании — как и подсказки выше. */
-  function setColor(id: keyof AmountColors, value: string) {
+  function setColor(id: AmountColorId, value: string) {
+    setColorPref(id, value)
+  }
+
+  function setColorPref<K extends keyof AmountColors>(id: K, value: AmountColors[K]) {
     const next = { ...colors, [id]: value }
     setColors(next)
     saveAmountColors(next)
@@ -338,6 +345,24 @@ export function SettingsScreen({ syncStatus, pending, dead, lastError, onSync, o
         </p>
       </section>
 
+      {/* нижняя панель */}
+      <section className="bg-bg-card border border-border rounded-2xl p-4 flex flex-col gap-3">
+        <div>
+          <p className="text-text-secondary text-xs uppercase tracking-widest">Нижняя панель</p>
+          <p className="text-text-muted text-[11px] mt-1">
+            Что держать под рукой и в каком порядке. Чем больше вкладок, тем они
+            компактнее — панель подстраивается сама.
+          </p>
+        </div>
+        <PickList items={NAV_TABS} value={nav} reorder min={2}
+          onChange={next => { setNav(next); saveNavTabs(next) }} />
+        <p className="text-text-muted text-[11px]">
+          «Главная» закреплена: с неё есть вход и в настройки, и в счета — убрав её,
+          можно было бы потерять дорогу назад. Разделы аналитики настраиваются
+          карандашом на самом экране аналитики.
+        </p>
+      </section>
+
       {/* цвета сумм */}
       <section className="bg-bg-card border border-border rounded-2xl p-4 flex flex-col gap-3">
         <div>
@@ -362,6 +387,18 @@ export function SettingsScreen({ syncStatus, pending, dead, lastError, onSync, o
             </span>
           </label>
         ))}
+        <label className="flex items-start gap-3 bg-bg-card2 rounded-xl px-3 py-2.5 cursor-pointer">
+          <input type="checkbox" checked={colors.byCategory}
+            onChange={e => setColorPref('byCategory', e.target.checked)}
+            className="mt-0.5 accent-[#6C63FF] flex-none" />
+          <span className="min-w-0">
+            <span className="text-text-primary text-sm block">Расходы — цветом категории</span>
+            <span className="text-text-muted text-[11px] block">
+              В списках сумма расхода красится в цвет своей категории, а не единым
+              красным. Доходы и переводы не трогаем: там цвет означает знак.
+            </span>
+          </span>
+        </label>
         <button onClick={resetColors} className="text-accent text-xs font-medium self-start">
           Вернуть стандартные
         </button>
